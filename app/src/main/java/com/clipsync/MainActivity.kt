@@ -536,32 +536,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildOnlineRow(dev: com.clipsync.model.OnlineDevice): View {
+        val outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, Design.dp(this@MainActivity, 6f), 0, Design.dp(this@MainActivity, 6f))
+        }
+        // 顶行：圆点 + 平台名 + 本机标签 + 时间
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, Design.dp(this@MainActivity, 6f), 0, Design.dp(this@MainActivity, 6f))
         }
-        // 状态圆点
-        val dot = View(this).apply {
-            background = Design.circleBg(Design.Color.SUCCESS)
-        }
+        val dot = View(this).apply { background = Design.circleBg(Design.Color.SUCCESS) }
         row.addView(dot, LinearLayout.LayoutParams(
             Design.dp(this, 8f), Design.dp(this, 8f)
         ))
-        // 角色名
-        val name = Design.text(this, dev.roleLabel, Design.Text.BODY, Design.Color.INK).apply {
+        val name = Design.text(this, dev.platformLabel, Design.Text.BODY, Design.Color.INK).apply {
             setPadding(Design.dp(this@MainActivity, 10f), 0, 0, 0)
         }
         row.addView(name, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
-        // 本机标签
         if (dev.self) {
             val selfTag = Design.text(this, "本机", Design.Text.MICRO, Design.Color.PRIMARY_PRESSED).apply {
-                background = Design.roundedBg(
-                    this@MainActivity, Design.Color.PRIMARY_TINT, Design.Radius.TAG
-                )
+                background = Design.roundedBg(this@MainActivity, Design.Color.PRIMARY_TINT, Design.Radius.TAG)
                 val h = Design.dp(this@MainActivity, 6f)
                 val v = Design.dp(this@MainActivity, 2f)
                 setPadding(h, v, h, v)
@@ -572,15 +569,51 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { leftMargin = Design.dp(this@MainActivity, 8f) })
         }
-        // IP 靠右
-        row.addView(
-            Design.text(this, dev.ip, Design.Text.MICRO, Design.Color.INK_MUTED),
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                leftMargin = Design.dp(this@MainActivity, 8f)
-                gravity = Gravity.END
-            }
+        // IP · 设备ID 靠右
+        val sub = Design.text(
+            this,
+            "${dev.ip} · ${dev.shortId}",
+            Design.Text.MICRO,
+            Design.Color.INK_MUTED
         )
-        return row
+        row.addView(sub, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+        ).apply {
+            leftMargin = Design.dp(this@MainActivity, 8f)
+            gravity = Gravity.END
+        })
+        outer.addView(row)
+
+        // 第二行：同步开关标签
+        val capsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(Design.dp(this@MainActivity, 18f), Design.dp(this@MainActivity, 5f), 0, 0)
+        }
+        capsRow.addView(buildCapTag("剪贴板", dev.clipUp))
+        capsRow.addView(buildCapTag("短信", dev.smsIn))
+        capsRow.addView(buildCapTag("自动接收", dev.autoPut))
+        outer.addView(capsRow)
+        return outer
+    }
+
+    private fun buildCapTag(text: String, on: Boolean): View {
+        val tag = Design.text(this, text, Design.Text.MICRO,
+            if (on) Design.Color.SUCCESS else Design.Color.INK_MUTED).apply {
+            background = Design.roundedBg(
+                this@MainActivity,
+                if (on) 0x2610B981.toInt() else 0x14000000,
+                Design.Radius.TAG
+            )
+            setPadding(Design.dp(this@MainActivity, 7f), Design.dp(this@MainActivity, 2f),
+                Design.dp(this@MainActivity, 7f), Design.dp(this@MainActivity, 2f))
+        }
+        val lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+        lp.rightMargin = Design.dp(this, 6f)
+        tag.layoutParams = lp
+        return tag
     }
 
     // MARK: - 剪贴板预览卡（占满中间）

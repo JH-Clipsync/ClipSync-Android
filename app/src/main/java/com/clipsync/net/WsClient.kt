@@ -39,7 +39,9 @@ class WsClient(
     private val token: String,
     private val deviceID: String,
     /** 端到端加密的同步密码；空串表示不加密 */
-    private val syncPassword: String = ""
+    private val syncPassword: String = "",
+    /** 本机同步能力/开关，逗号分隔，上报给服务端用于在线列表展示 */
+    private val caps: String = ""
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
@@ -144,7 +146,8 @@ class WsClient(
      * 使用 CompletableDeferred 替代 Thread.sleep，确保连接失败/关闭后能正确返回并重试。
      */
     private suspend fun connectOnce() {
-        val url = "$serverUrl/ws?token=$token&device=$deviceID&role=${ClientRole.MOBILE}"
+        var url = "$serverUrl/ws?token=$token&device=$deviceID&role=${ClientRole.MOBILE}&platform=android"
+        if (caps.isNotEmpty()) url += "&caps=$caps"
         val req = Request.Builder().url(url).build()
         _state.value = State.CONNECTING
 

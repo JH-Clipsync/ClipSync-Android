@@ -299,6 +299,24 @@ class SyncService : Service() {
         return fresh
     }
 
+    /**
+     * 读取本机同步开关，拼成上报字符串：
+     *   clip_up  = 本机剪贴板变化会自动上行（upload_enabled）
+     *   sms_in   = 短信同步上行（同步总开关开启即视为开启，短信由 SmsReceiver/通知监听触发）
+     *   auto_put = 收到远端剪贴板自动写入本机（auto_apply）
+     */
+    private fun buildCaps(): String {
+        val sp = getSharedPreferences("clipsync", MODE_PRIVATE)
+        val uploadEnabled = sp.getBoolean("upload_enabled", false)
+        val autoApply = sp.getBoolean("auto_apply", true)
+        val syncOn = sp.getBoolean("sync_enabled", false)
+        val parts = mutableListOf<String>()
+        if (uploadEnabled) parts += "clip_up"
+        if (syncOn) parts += "sms_in"
+        if (autoApply) parts += "auto_put"
+        return parts.joinToString(",")
+    }
+
     /** 拿到 token 后真正建立 WebSocket 连接 */
     private fun openWs(server: String, token: String) {
         // 服务已被销毁（用户点了取消）就别再建连，否则留下一个没人回收的连接
@@ -310,7 +328,9 @@ class SyncService : Service() {
         val deviceID = stableDeviceID()
         // 加密开启时用有效密码（用户没填就是内置默认密码）；关闭时空串走明文
         val syncPassword = com.clipsync.crypto.PayloadCipher.effectivePassword(this)
-        val wsClient = WsClient(server, token, deviceID, syncPassword).also { it.start() }
+        // 本机同步开关，上报给服务端用于在线列表展示
+        val caps = buildCaps()
+        val wsClient = WsClient(server, token, deviceID, syncPassword, caps).also { it.start() }
         ws = wsClient
         currentWs = wsClient
 

@@ -98,9 +98,11 @@ data class Message(
 data class OnlineDevice(
     @kotlinx.serialization.SerialName("device_id") val deviceId: String = "",
     val role: String = "",
+    val platform: String = "",
     val ip: String = "",
     @kotlinx.serialization.SerialName("online_at") val onlineAt: Long = 0L,
-    val self: Boolean = false
+    val self: Boolean = false,
+    val caps: Map<String, Boolean> = emptyMap()
 ) {
     val roleLabel: String
         get() = when (role) {
@@ -108,6 +110,28 @@ data class OnlineDevice(
             ClientRole.PC -> "电脑"
             else -> role
         }
+
+    val platformLabel: String
+        get() = when (platform.lowercase()) {
+            "mac" -> "macOS"
+            "windows" -> "Windows"
+            "linux" -> "Linux"
+            "android" -> "Android"
+            "ios" -> "iOS"
+            else -> if (role == ClientRole.MOBILE) "手机" else "电脑"
+        }
+
+    /** 设备 ID 展示：去掉前缀，取前 8 位 */
+    val shortId: String
+        get() {
+            val id = deviceId
+            val body = id.substringAfter("-", id)
+            return body.take(8)
+        }
+
+    val clipUp: Boolean get() = caps["clip_up"] == true
+    val smsIn: Boolean get() = caps["sms_in"] == true
+    val autoPut: Boolean get() = caps["auto_put"] == true
 }
 
 /** presence 消息的 payload 包装 */
