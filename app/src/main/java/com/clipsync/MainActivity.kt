@@ -57,13 +57,26 @@ class MainActivity : AppCompatActivity() {
     private lateinit var clipFootnote: TextView
     private lateinit var pushBtn: Button
 
+    // 在线设备
+    private lateinit var onlineCard: LinearLayout
+    private lateinit var onlineCount: TextView
+    private lateinit var onlineList: LinearLayout
+
+    private val presenceListener: (List<com.clipsync.model.OnlineDevice>) -> Unit = { devices ->
+        runOnUiThread { renderPresence(devices) }
+    }
+
     private var dotAnimator: ObjectAnimator? = null
     private var lastWasConnecting = false
 
     /** 顶部轻提示，替代会挡住底部按钮的系统 Toast */
     private lateinit var toast: com.clipsync.ui.DesignToast
 
-    private val stateListener: (String) -> Unit = { state -> renderState(state) }
+    private val stateListener: (String) -> Unit = { state ->
+        renderState(state)
+        // 断线/重连时刷新在线设备卡的"离线/获取中"提示
+        runOnUiThread { renderPresence(com.clipsync.state.PresenceBus.current) }
+    }
     private val previewListener: () -> Unit = { refreshClipPreview() }
 
     private val mediaPermLauncher = registerForActivityResult(
@@ -115,6 +128,10 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
+        content.addView(buildOnlineCard(), LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Design.dp(this@MainActivity, Design.Space.M) })
         content.addView(buildClipCard(), LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
@@ -244,6 +261,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         ConnectionBus.addListener(stateListener)
+        com.clipsync.state.PresenceBus.addListener(presenceListener)
         renderTarget()
         com.clipsync.clipboard.ClipboardManagerHelper.onForeground()
         // 不要在回前台时偷偷拉起服务：用户没点过「启动」就让它空着。
@@ -293,6 +311,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         ConnectionBus.removeListener(stateListener)
+        com.clipsync.state.PresenceBus.removeListener(presenceListener)
         super.onDestroy()
     }
 
@@ -424,6 +443,144 @@ class MainActivity : AppCompatActivity() {
         (ringOuter.background as? GradientDrawable)?.setColor(outer)
         (ringMid.background as? GradientDrawable)?.setColor(mid)
         (ringCore.background as? GradientDrawable)?.setColor(core)
+    }
+
+    // MARK: - 在线设备卡
+
+    private fun buildOnlineCard(): View {
+        onlineCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Design.outlinedBg(
+                this@MainActivity,
+                Design.Color.SURFACE,
+                Design.Color.BORDER_CARD,
+                Design.Radius.CARD
+            )
+            val p = Design.dp(this@MainActivity, 15f)
+            setPadding(p, p, p, p)
+        }
+
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        titleRow.addView(
+            Design.text(this, "在线设备", Design.Text.CARD_TITLE, Design.Color.INK, bold = true),
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        onlineCount = Design.text(this, "", Design.Text.TAG, Design.Color.SUCCESS).apply {
+            background = Design.roundedBg(
+                this@MainActivity, Design.Color.SUCCESS_TINT, Design.Radius.TAG
+            )
+            val h = Design.dp(this@MainActivity, Design.Space.S)
+            val v = Design.dp(this@MainActivity, 3f)
+            setPadding(h, v, h, v)
+        }
+        titleRow.addView(onlineCount)
+        onlineCard.addView(titleRow)
+
+        onlineList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        onlineCard.addView(onlineList, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Design.dp(this@MainActivity, 8f) })
+
+        // 先用当前缓存渲染一次（从后台切回前台时不闪空）
+        renderPresence(com.clipsync.state.PresenceBus.current)
+        return onlineCard
+    }
+
+    private fun renderPresence(devices: List<com.clipsync.model.OnlineDevice>) {
+        if (!::onlineList.isInitialized || !::onlineCount.isInitialized) return
+        onlineList.removeAllViews()
+
+        val connected = ConnectionBus.current == ConnectionBus.STATE_OPEN
+        if (!connected) {
+            onlineCount.text = "离线"
+            onlineCount.setTextColor(Design.Color.INK_MUTED)
+            (onlineCount.background as? GradientDrawable)?.setColor(Design.Color.NEUTRAL_TINT)
+            addOnlineHint("连接服务器后显示在线设备")
+            return
+        }
+        if (devices.isEmpty()) {
+            onlineCount.text = "获取中…"
+            onlineCount.setTextColor(Design.Color.INK_MUTED)
+            (onlineCount.background as? GradientDrawable)?.setColor(Design.Color.NEUTRAL_TINT)
+            addOnlineHint("正在获取在线设备…")
+            return
+        }
+
+        onlineCount.text = "${devices.size} 台在线"
+        onlineCount.setTextColor(Design.Color.SUCCESS)
+        (onlineCount.background as? GradientDrawable)?.setColor(Design.Color.SUCCESS_TINT)
+
+        devices.forEach { dev ->
+            onlineList.addView(buildOnlineRow(dev), LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+    }
+
+    private fun addOnlineHint(text: String) {
+        onlineList.removeAllViews()
+        onlineList.addView(
+            Design.text(this, text, Design.Text.CAPTION, Design.Color.INK_MUTED),
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+    }
+
+    private fun buildOnlineRow(dev: com.clipsync.model.OnlineDevice): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, Design.dp(this@MainActivity, 6f), 0, Design.dp(this@MainActivity, 6f))
+        }
+        // 状态圆点
+        val dot = View(this).apply {
+            background = Design.circleBg(Design.Color.SUCCESS)
+        }
+        row.addView(dot, LinearLayout.LayoutParams(
+            Design.dp(this, 8f), Design.dp(this, 8f)
+        ))
+        // 角色名
+        val name = Design.text(this, dev.roleLabel, Design.Text.BODY, Design.Color.INK).apply {
+            setPadding(Design.dp(this@MainActivity, 10f), 0, 0, 0)
+        }
+        row.addView(name, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        // 本机标签
+        if (dev.self) {
+            val selfTag = Design.text(this, "本机", Design.Text.MICRO, Design.Color.PRIMARY_PRESSED).apply {
+                background = Design.roundedBg(
+                    this@MainActivity, Design.Color.PRIMARY_TINT, Design.Radius.TAG
+                )
+                val h = Design.dp(this@MainActivity, 6f)
+                val v = Design.dp(this@MainActivity, 2f)
+                setPadding(h, v, h, v)
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            }
+            row.addView(selfTag, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { leftMargin = Design.dp(this@MainActivity, 8f) })
+        }
+        // IP 靠右
+        row.addView(
+            Design.text(this, dev.ip, Design.Text.MICRO, Design.Color.INK_MUTED),
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = Design.dp(this@MainActivity, 8f)
+                gravity = Gravity.END
+            }
+        )
+        return row
     }
 
     // MARK: - 剪贴板预览卡（占满中间）

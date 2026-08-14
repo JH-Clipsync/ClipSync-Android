@@ -330,7 +330,17 @@ class SyncService : Service() {
 
         subscribeIncoming(wsClient)
         subscribeState(wsClient)
+        subscribePresence(wsClient)
         subscribeAuthFailure(wsClient, server)
+    }
+
+    /** 订阅在线设备列表，转发给 PresenceBus 供 MainActivity 展示 */
+    private fun subscribePresence(wsClient: WsClient) {
+        serviceScope.launch {
+            wsClient.onlineDevices.collect { devices ->
+                com.clipsync.state.PresenceBus.publish(devices)
+            }
+        }
     }
 
     /**

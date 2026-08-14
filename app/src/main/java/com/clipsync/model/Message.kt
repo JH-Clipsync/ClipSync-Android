@@ -17,6 +17,8 @@ object MessageType {
     const val CLIPBOARD = "clipboard"
     /** 服务端踢下线通知（密码重置/封禁） */
     const val SERVER_KICK = "server_kick"
+    /** 在线设备列表变更（服务端上下线时下发） */
+    const val PRESENCE = "presence"
 }
 
 /**
@@ -90,3 +92,31 @@ data class Message(
     /** 便捷：直接算出内容格式 */
     val content: String get() = MessageContent.of(payload.kind, payload.mime)
 }
+
+/** 在线设备（服务端 presence 消息里的一台设备） */
+@Serializable
+data class OnlineDevice(
+    @kotlinx.serialization.SerialName("device_id") val deviceId: String = "",
+    val role: String = "",
+    val ip: String = "",
+    @kotlinx.serialization.SerialName("online_at") val onlineAt: Long = 0L,
+    val self: Boolean = false
+) {
+    val roleLabel: String
+        get() = when (role) {
+            ClientRole.MOBILE -> "手机"
+            ClientRole.PC -> "电脑"
+            else -> role
+        }
+}
+
+/** presence 消息的 payload 包装 */
+@Serializable
+data class PresencePayload(val devices: List<OnlineDevice> = emptyList())
+
+/** presence 消息外层信封 */
+@Serializable
+data class PresenceEnvelope(
+    val type: String = "",
+    val payload: PresencePayload = PresencePayload()
+)

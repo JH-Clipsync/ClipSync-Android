@@ -54,6 +54,10 @@ class WsClient(
     private val _incoming = MutableSharedFlow<Message>(extraBufferCapacity = 32)
     val incoming: SharedFlow<Message> = _incoming
 
+    /** 当前账号下的在线设备列表（服务端 presence 推送实时更新） */
+    private val _onlineDevices = MutableStateFlow<List<com.clipsync.model.OnlineDevice>>(emptyList())
+    val onlineDevices: StateFlow<List<com.clipsync.model.OnlineDevice>> = _onlineDevices
+
     /** 连接状态流（StateFlow 保证新订阅者立即拿到当前状态） */
     private val _state = MutableStateFlow(State.CLOSED)
     val state: StateFlow<State> = _state
@@ -94,6 +98,7 @@ class WsClient(
         job?.cancel()
         ws?.close(1000, "bye")
         ws = null
+        _onlineDevices.value = emptyList()
     }
 
     /** 回前台时调用：跳过退避等待立即重连 */
@@ -153,6 +158,16 @@ class WsClient(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                runCatching {
+                    // presence 消息的 payload 是 {"devices":[...]}，跟业务消息结构不同，
+                    // 先单独解析并更新在线设备列表，不进业务消息流
+                    val presence = json.decodeFromString<com.clipsync.model.PresenceEnvelope>(text)
+                    if (presence.type == com.clipsync.model.MessageType.PRESENCE) {
+                        _onlineDevices.value = presence.payload.devices
+                        Log.i("ClipSync", "👥 在线设备更新：${presence.payload.devices.size} 台")
+                        return@runCatching
+                    }
+                }.onFailure { /* 不是 presence，按普通消息处理 */ }
                 runCatching {
                     val msg = json.decodeFromString<Message>(text)
                     _incoming.tryEmit(decryptIncoming(msg) ?: return)

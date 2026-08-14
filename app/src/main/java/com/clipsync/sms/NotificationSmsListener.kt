@@ -55,14 +55,23 @@ class NotificationSmsListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
-        Log.i(TAG, "🟢 通知监听已连接")
+        Log.i(TAG, "🟢 [通知监听] onListenerConnected —— 已连接，开始接收通知")
+    }
+
+    override fun onListenerDisconnected() {
+        super.onListenerDisconnected()
+        Log.w(TAG, "🔴 [通知监听] onListenerDisconnected —— 已断开")
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         // 同步未启用就不拉服务，与 SmsReceiver 保持一致。
-        if (!SyncService.isUserEnabled(this)) return
+        if (!SyncService.isUserEnabled(this)) {
+            // 不打日志避免刷屏
+            return
+        }
 
         val pkg = sbn.packageName ?: return
+        Log.d(TAG, "📬 [通知监听] 收到通知 pkg=$pkg id=${sbn.id}")
 
         // 先拉黑安全中心/手机管家类 App：这些的所有通知都不处理
         if (BLOCKED_PACKAGES.contains(pkg) ||

@@ -21,6 +21,7 @@ import java.util.UUID
 class SmsReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
+        Log.i("ClipSync", "📨 [短信诊断] SmsReceiver.onReceive action=${intent.action}")
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
 
         // 1) 立刻拿 PendingResult：onReceive 返回后进程至少还能活 ~30s
@@ -29,12 +30,15 @@ class SmsReceiver : BroadcastReceiver() {
         // 2) 用户没启用同步：不丢，只打日志，直接退。MIUI 冷启动场景下会拉起应用，
         //    用户在 App 里没有点"开始同步"就别乱拉后台服务。
         if (!SyncService.isUserEnabled(context)) {
-            Log.i("ClipSync", "⏸ 短信丢弃：同步未启用（用户在 App 中停止了或刚划掉进程）")
+            Log.i("ClipSync", "⏸ [短信诊断] 短信丢弃：同步未启用（sync_enabled=false）")
             pr.finish()
             return
         }
+        Log.i("ClipSync", "📨 [短信诊断] 同步已启用，开始解析短信 PDUs")
 
-        val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: run {
+        val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
+        if (messages == null) {
+            Log.w("ClipSync", "⚠️ [短信诊断] getMessagesFromIntent 返回 null，无法解析")
             pr.finish()
             return
         }
