@@ -149,7 +149,7 @@ class SettingsActivity : AppCompatActivity() {
             sp.edit().putBoolean("auto_connect", checked).apply()
         }
 
-        // 快捷操作：填完账号密码后可直接在此发起连接；已连接后隐藏（断开在主页操作）
+        // 快捷操作：填完账号密码后可直接在此发起连接（已连接则重连）。断开同步在主页操作。
         SettingsRows.separator(this, card)
         quickConnectBtn = Button(this).apply {
             text = "立即连接"
@@ -180,21 +180,20 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun refreshQuickConnectBtn(state: String = com.clipsync.state.ConnectionBus.current) {
         if (!::quickConnectBtn.isInitialized) return
-        val connected = state == com.clipsync.state.ConnectionBus.STATE_OPEN ||
-            SyncService.activeWs() != null
-        // 已连接就隐藏按钮：断开同步统一在主页操作，设置页只负责"填完密码快速连一下"
-        quickConnectBtn.visibility = if (connected) View.GONE else View.VISIBLE
+        // 按钮始终可见：未连接是"发起连接"，已连接是"重连"
+        quickConnectBtn.visibility = View.VISIBLE
     }
 
-    /** 设置页内的"立即连接"：启动 SyncService。 */
+    /**
+     * 设置页内的"立即连接"：
+     *  - 未连接：直接启动 SyncService 发起连接；
+     *  - 已连接 / 连接中：重启服务，让刚改的账号密码 / 服务器 / 加密设置立刻生效。
+     */
     private fun connectFromSettings() {
         SyncService.setUserEnabled(this, true)
         ConnectionBus.clearKicked()
-        val intent = Intent(this, SyncService::class.java).apply {
-            action = SyncService.ACTION_CONNECT
-        }
-        if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(intent)
-        else startService(intent)
+        // 地址、账密、加密这些参数是服务启动时读的，已在运行就重启一次让新配置生效
+        SyncService.restart(this)
     }
 
     private fun accountSummary(): String {

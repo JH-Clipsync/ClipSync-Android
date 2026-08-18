@@ -84,6 +84,7 @@ jobs:
           VERSION_CODE="${{ github.event.inputs.versionCode }}"
           sed -i "s/versionName = \".*\"/versionName = \"$VERSION_NAME\"/" app/build.gradle.kts
           sed -i "s/versionCode = .*/versionCode = $VERSION_CODE/" app/build.gradle.kts
+          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_ENV
           echo "已设置 versionName=$VERSION_NAME versionCode=$VERSION_CODE"
 
       - name: 提取 tag 版本号
@@ -92,6 +93,7 @@ jobs:
         run: |
           TAG=${GITHUB_REF#refs/tags/v}
           echo "VERSION_NAME=$TAG" >> $GITHUB_OUTPUT
+          echo "VERSION_NAME=$TAG" >> $GITHUB_ENV
           echo "VERSION_CODE=$(date +%s)" >> $GITHUB_OUTPUT
 
       - name: 注入 tag 版本号
@@ -113,8 +115,8 @@ jobs:
             echo "❌ 没找到 APK"
             exit 1
           fi
-          BASENAME=$(basename "$APK" .apk)
-          TARGET="artifacts/ClipSync-${BASENAME}.apk"
+          VER="${VERSION_NAME:-unknown}"
+          TARGET="artifacts/ClipSync-${VER}.apk"
           cp "$APK" "$TARGET"
           echo "APK_PATH=$TARGET" >> $GITHUB_OUTPUT
           echo "📦 已生成 $TARGET ($(du -h "$TARGET" | cut -f1))"
