@@ -1,6 +1,7 @@
 package com.clipsync.net
 
 import android.util.Log
+import android.os.Build
 import com.clipsync.crypto.PayloadCipher
 import com.clipsync.model.ClientRole
 import com.clipsync.model.Message
@@ -146,7 +147,9 @@ class WsClient(
      * 使用 CompletableDeferred 替代 Thread.sleep，确保连接失败/关闭后能正确返回并重试。
      */
     private suspend fun connectOnce() {
-        var url = "$serverUrl/ws?token=$token&device=$deviceID&role=${ClientRole.MOBILE}&platform=android"
+        val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+        val encodedName = java.net.URLEncoder.encode(deviceName, "UTF-8")
+        var url = "$serverUrl/ws?token=$token&device=$deviceID&role=${ClientRole.MOBILE}&platform=android&name=$encodedName"
         if (caps.isNotEmpty()) url += "&caps=$caps"
         val req = Request.Builder().url(url).build()
         _state.value = State.CONNECTING

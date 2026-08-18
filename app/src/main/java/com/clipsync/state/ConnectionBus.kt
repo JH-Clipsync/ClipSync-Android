@@ -1,89 +1,163 @@
 package com.clipsync.state
 
-import android.os.Handler
-import android.os.Looper
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * 连接状态总线。SyncService 更新状态，MainActivity 注册监听刷新 UI。
- * 用静态回调实现，不引入新依赖。
+ * 连接状态总线：服务（SyncService）和界面（MainActivity 等）之间的唯一桥梁。
  *
- * 除状态本身，还带一条可选的 [failureReason]：连接失败的具体原因
- * （账密不对 / 网络不通 / 地址错误），供界面直接展示。
+ * 服务是唯一能感知 WebSocket 真实状态的地方，但它没有界面；界面想显示状态、
+ * 想在"被踢下线"时弹提示，就通过这个单例订阅。
+ *
+ * 状态用字符串常量表示（[STATE_OPEN] / [STATE_CONNECTING] / [STATE_CLOSED]），
+ * 同时在 [stateFlow] 里暴露一个 [State] 枚举流给协程订阅。
  */
 object ConnectionBus {
 
+    // 简单字符串状态，MainActivity/SettingsActivity 在用
+    const val STATE_OPEN = "connected"
+    const val STATE_CONNECTED = "connected"
     const val STATE_CONNECTING = "connecting"
-    const val STATE_OPEN = "open"
     const val STATE_CLOSED = "closed"
 
-    @Volatile
-    var current: String = STATE_CLOSED
-        private set
+    enum class State { CONNECTED, CONNECTING, DISCONNECTED }
 
     /**
-     * 最近一次连接失败的原因；null 表示没有已知失败。
-     * 进入 CONNECTING / OPEN 时自动清空，避免旧错误留在界面上。
+     * 被踢下线的原因。服务端 server_kick 消息的 payload.reason 映射到这里。
+     */
+    const val KICKED_PASSWORD_RESET = "password_reset"
+    const val KICKED_USER_DISABLED = "user_disabled"
+    const val KICKED_USER_DELETED = "user_deleted"
+    const val KICKED_DEVICE_BANNED = "device_banned"
+    const val KICKED_DEVICE_KICKED = "device_kicked"
+    const val KICKED_OTHER = ""
+
+    private val _stateFlow = MutableStateFlow(State.DISCONNECTED)
+    val stateFlow: StateFlow<State> = _stateFlow.asStateFlow()
+
+    /**
+     * 当前状态字符串（STATE_*）。UI 通过它渲染按钮文案。
+     */
+    val current: String get() = when (_stateFlow.value) {
+        State.CONNECTED -> STATE_OPEN
+        State.CONNECTING -> STATE_CONNECTING
+        State.DISCONNECTED -> STATE_CLOSED
+    }
+
+    /**
+     * 失败原因（用户可看懂的中文句子）。普通连接失败和被踢下线都写到这里，
+     * UI 用它显示在状态提示行。String? 形式给同步代码直接读，
+     * [failureReasonFlow] 给协程订阅。
      */
     @Volatile
     var failureReason: String? = null
         private set
 
+    private val _failureReasonFlow = MutableStateFlow<String?>(null)
+    val failureReasonFlow: StateFlow<String?> = _failureReasonFlow.asStateFlow()
+
     /**
-     * 是否因密码被管理端重置/封禁而被踢下线。
-     * 为 true 时 UI 显示「修改密码」按钮，不自动重连。
-     * 用户修改密码后调 [clearKicked] 清除。
+     * 被踢下线的原因。服务收到 server_kick 消息时写入；新连接建立成功会清空。
      */
     @Volatile
-    var kicked: Boolean = false
+    var kickedReason: String? = null
         private set
 
-    private val listeners = mutableListOf<(String) -> Unit>()
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val _kickedReasonFlow = MutableStateFlow<String?>(null)
+    val kickedReasonFlow: StateFlow<String?> = _kickedReasonFlow.asStateFlow()
+
+    /** 兼容旧 UI：是否处于"被踢下线"状态 */
+    val kicked: Boolean get() = kickedReason != null
+
+    /** 旧代码通过 addListener/removeListener 订阅状态变化（只关心状态字符串） */
+    fun interface Listener {
+        fun onStateChanged(state: String)
+    }
+    private val listeners = java.util.concurrent.CopyOnWriteArrayList<Listener>()
+
+    fun addListener(l: Listener) { listeners.addIfAbsent(l) }
+    fun removeListener(l: Listener) { listeners.remove(l) }
+
+    private fun notifyListeners() {
+        val s = current
+        listeners.forEach { runCatching { it.onStateChanged(s) } }
+    }
+
+    fun connected() {
+        _stateFlow.value = State.CONNECTED
+        failureReason = null
+        _failureReasonFlow.value = null
+        kickedReason = null
+        _kickedReasonFlow.value = null
+        notifyListeners()
+    }
+    fun connecting() {
+        _stateFlow.value = State.CONNECTING
+        notifyListeners()
+    }
+    fun disconnected(reason: String? = null) {
+        _stateFlow.value = State.DISCONNECTED
+        if (reason != null) {
+            failureReason = reason
+            _failureReasonFlow.value = reason
+        }
+        notifyListeners()
+    }
 
     /**
-     * @param reason 仅在 [STATE_CLOSED] 时有意义；传 null 表示"正常断开，无错误"
+     * 发布一个状态变更，可选附带一句失败提示。
+     */
+    fun publish(state: String, reason: String? = null) {
+        when (state) {
+            STATE_CONNECTED -> connected()
+            STATE_CONNECTING -> connecting()
+            STATE_CLOSED -> disconnected(reason)
+        }
+    }
+
+    /**
+     * 被服务端踢下线，携带原因。
+     * 兼容旧服务端没有 reason 的情况：默认当成密码重置。
      */
     @JvmOverloads
-    fun publish(state: String, reason: String? = null) {
-        current = state
-        failureReason = if (state == STATE_CLOSED) reason else null
-        // 进入连接中/已连接时清除踢下线标记
-        if (state != STATE_CLOSED) kicked = false
-        val snapshot: List<(String) -> Unit>
-        synchronized(listeners) { snapshot = listeners.toList() }
-        mainHandler.post {
-            snapshot.forEach { it(state) }
-        }
+    fun kicked(reason: String? = KICKED_OTHER) {
+        val r = reason ?: KICKED_OTHER
+        kickedReason = r
+        _kickedReasonFlow.value = r
+        val prompt = kickedPrompt(r)
+        failureReason = prompt
+        _failureReasonFlow.value = prompt
+        _stateFlow.value = State.DISCONNECTED
+        notifyListeners()
     }
 
-    /** 标记被踢下线（密码重置/封禁），UI 据此显示修改密码按钮 */
-    fun publishKicked(reason: String? = null) {
-        current = STATE_CLOSED
-        failureReason = reason
-        kicked = true
-        val snapshot: List<(String) -> Unit>
-        synchronized(listeners) { snapshot = listeners.toList() }
-        mainHandler.post {
-            snapshot.forEach { it(STATE_CLOSED) }
+    /**
+     * 旧调用方式：直接给一句中文提示。
+     */
+    fun publishKicked(prompt: String? = null) {
+        val reason = when {
+            prompt == null -> KICKED_OTHER
+            prompt.contains("密码") -> KICKED_PASSWORD_RESET
+            else -> KICKED_OTHER
         }
+        kicked(reason)
     }
 
-    /** 用户修改密码后清除踢下线标记 */
     fun clearKicked() {
-        kicked = false
-        failureReason = null
+        kickedReason = null
+        _kickedReasonFlow.value = null
     }
 
-    fun addListener(l: (String) -> Unit) {
-        synchronized(listeners) { listeners.add(l) }
-        // 立即同步一次当前状态。不能用 mainHandler.post，否则会延迟到 onResume
-        // 之后的代码（含 autoConnectIfNeeded → renderState(CONNECTING)）都执行完
-        // 才跑，把刚渲染好的"连接中"覆盖回"未连接"。
-        // addListener 目前只在主线程（onResume）调用，直接调用是安全的。
-        l(current)
-    }
-
-    fun removeListener(l: (String) -> Unit) {
-        synchronized(listeners) { listeners.remove(l) }
+    /**
+     * 根据 reason 返回用户能看懂的中文提示。
+     */
+    fun kickedPrompt(reason: String?): String = when (reason) {
+        KICKED_PASSWORD_RESET -> "密码已被管理员重置，请修改密码后重新连接"
+        KICKED_USER_DISABLED -> "账号已被管理员禁用，请联系管理员"
+        KICKED_USER_DELETED -> "账号已被删除"
+        KICKED_DEVICE_BANNED -> "当前设备已被管理员禁用，请联系管理员"
+        KICKED_DEVICE_KICKED -> "已被管理员强制下线，可重新连接"
+        else -> "已被服务端强制下线，请重新登录"
     }
 }

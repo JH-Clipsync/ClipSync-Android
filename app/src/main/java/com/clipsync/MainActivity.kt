@@ -18,6 +18,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
 import com.clipsync.clipboard.ClipboardManagerHelper
 import com.clipsync.service.SyncService
 import com.clipsync.state.ConnectionBus
@@ -25,6 +26,9 @@ import com.clipsync.ui.Design
 import com.clipsync.ui.HistoryActivity
 import com.clipsync.ui.SettingsActivity
 import com.clipsync.ui.ThemeManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 主界面。
@@ -47,6 +51,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var changePwdBtn: Button
     /** 当前服务器地址，供 renderState 拼接到状态提示里 */
     private var serverAddr: String = ""
+    /** 通知监听未连接时显示的警告条 */
+    private lateinit var notifListenerWarning: View
 
     // 剪贴板预览
     private lateinit var clipPreviewText: TextView
@@ -68,6 +74,9 @@ class MainActivity : AppCompatActivity() {
 
     private var dotAnimator: ObjectAnimator? = null
     private var lastWasConnecting = false
+
+    /** 当前展开「重命名」圆形按钮的行；同时只允许一个，点其他行会收起 */
+    private var activeRenameFab: View? = null
 
     /** 顶部轻提示，替代会挡住底部按钮的系统 Toast */
     private lateinit var toast: com.clipsync.ui.DesignToast
@@ -128,11 +137,17 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
-        content.addView(buildOnlineCard(), LinearLayout.LayoutParams(
+        notifListenerWarning = buildNotifListenerWarning().also {
+            content.addView(it, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Design.dp(this@MainActivity, Design.Space.M) })
+        }
+        content.addView(buildClipCard(), LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = Design.dp(this@MainActivity, Design.Space.M) })
-        content.addView(buildClipCard(), LinearLayout.LayoutParams(
+        content.addView(buildOnlineCard(), LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = Design.dp(this@MainActivity, Design.Space.M) })
@@ -263,6 +278,7 @@ class MainActivity : AppCompatActivity() {
         ConnectionBus.addListener(stateListener)
         com.clipsync.state.PresenceBus.addListener(presenceListener)
         renderTarget()
+        refreshNotifListenerWarning()
         com.clipsync.clipboard.ClipboardManagerHelper.onForeground()
         // 不要在回前台时偷偷拉起服务：用户没点过「启动」就让它空着。
         // 仅在服务还活着时踢一脚加速重连。SyncService 自己是前台服务 + START_STICKY，
@@ -322,6 +338,57 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 历史 / 设置入口已放到底部悬浮操作层，不再占用 ActionBar 菜单
+
+    // MARK: - 通知监听警告条
+
+    /**
+     * 构造通知监听假开启警告条。
+     * MIUI/HyperOS 上 App 重装/升级后，系统设置里显示已授权但 Listener 未实际绑定，
+     * 此时短信通知完全收不到。检测到未连接时显示此横幅，点击跳转到通知使用权设置。
+     */
+    private fun buildNotifListenerWarning(): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Design.roundedBg(this@MainActivity, 0xFFFFF4E5.toInt(), Design.Radius.TAG)
+            setPadding(Design.dp(this@MainActivity, 12f), Design.dp(this@MainActivity, 10f),
+                Design.dp(this@MainActivity, 12f), Design.dp(this@MainActivity, 10f))
+            isClickable = true
+            visibility = View.GONE
+            setOnClickListener {
+                try {
+                    startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+                } catch (_: Exception) {}
+            }
+            val dot = View(this@MainActivity).apply {
+                background = Design.circleBg(0xFFFF9800.toInt())
+            }
+            addView(dot, LinearLayout.LayoutParams(Design.dp(this@MainActivity, 8f), Design.dp(this@MainActivity, 8f)))
+            val text = Design.text(
+                this@MainActivity,
+                "通知监听未连接，短信可能无法同步。点此去设置关闭再重新开启",
+                Design.Text.MICRO, 0xFFE65100.toInt()
+            ).apply {
+                setPadding(Design.dp(this@MainActivity, 8f), 0, 0, 0)
+            }
+            addView(text, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+    }
+
+    private fun refreshNotifListenerWarning() {
+        if (!::notifListenerWarning.isInitialized) return
+        if (com.clipsync.sms.NotificationSmsListener.isConnected) {
+            notifListenerWarning.visibility = View.GONE
+            return
+        }
+        // 未连接：先尝试自动重连，2.5 秒后再检查，仍未连上才提示用户
+        com.clipsync.sms.NotificationSmsListener.ensureConnected(this)
+        notifListenerWarning.postDelayed({
+            if (!com.clipsync.sms.NotificationSmsListener.isConnected) {
+                notifListenerWarning.visibility = View.VISIBLE
+            }
+        }, 2500)
+    }
 
     // MARK: - 状态卡（重设计：背景随状态变色，大号圆点 + 状态文字 + 服务器地址 + 启动按钮）
 
@@ -549,13 +616,22 @@ class MainActivity : AppCompatActivity() {
         row.addView(dot, LinearLayout.LayoutParams(
             Design.dp(this, 8f), Design.dp(this, 8f)
         ))
-        val name = Design.text(this, dev.platformLabel, Design.Text.BODY, Design.Color.INK).apply {
+        val name = Design.text(this, dev.displayName, Design.Text.BODY, Design.Color.INK).apply {
             setPadding(Design.dp(this@MainActivity, 10f), 0, 0, 0)
         }
         row.addView(name, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
+        if (dev.name.isNotBlank()) {
+            val plat = Design.text(this, dev.platformLabel, Design.Text.MICRO, Design.Color.INK_MUTED).apply {
+                setPadding(Design.dp(this@MainActivity, 6f), 0, 0, 0)
+            }
+            row.addView(plat, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { gravity = Gravity.CENTER_VERTICAL })
+        }
         if (dev.self) {
             val selfTag = Design.text(this, "本机", Design.Text.MICRO, Design.Color.PRIMARY_PRESSED).apply {
                 background = Design.roundedBg(this@MainActivity, Design.Color.PRIMARY_TINT, Design.Radius.TAG)
@@ -593,7 +669,262 @@ class MainActivity : AppCompatActivity() {
         capsRow.addView(buildCapTag("短信", dev.smsIn))
         capsRow.addView(buildCapTag("自动接收", dev.autoPut))
         outer.addView(capsRow)
-        return outer
+
+        // 长按后在设备行水平居中显示的「重命名」按钮
+        val renameBtn = android.widget.Button(this).apply {
+            text = "重命名"
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 13f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            gravity = Gravity.CENTER
+            isAllCaps = false
+            val padH = Design.dp(this@MainActivity, 16f)
+            setPadding(padH, 0, padH, 0)
+            minHeight = 0
+            minimumHeight = 0
+            minWidth = 0
+            minimumWidth = 0
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                cornerRadius = Design.dp(this@MainActivity, 100f).toFloat()
+                setColor(Design.Color.PRIMARY)
+            }
+            elevation = Design.dp(this@MainActivity, 3f).toFloat()
+            stateListAnimator = null
+            visibility = View.GONE
+            setOnClickListener { showRenameDialog(dev) }
+        }
+
+        val wrapper = android.widget.FrameLayout(this).apply {
+            addView(outer, android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
+            ))
+            addView(renameBtn, android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                gravity = Gravity.CENTER
+                val vm = Design.dp(this@MainActivity, 3f)
+                topMargin = vm
+                bottomMargin = vm
+            })
+        }
+
+        outer.setOnLongClickListener {
+            val wasShown = renameBtn.visibility == View.VISIBLE
+            hideActiveRenameFab()
+            if (!wasShown) {
+                renameBtn.visibility = View.VISIBLE
+                renameBtn.alpha = 0f
+                renameBtn.animate().alpha(1f).setDuration(140).start()
+                activeRenameFab = renameBtn
+            }
+            true
+        }
+        return wrapper
+    }
+
+    private fun hideActiveRenameFab() {
+        activeRenameFab?.let { fab ->
+            fab.animate().alpha(0f).setDuration(120).withEndAction { fab.visibility = View.GONE }.start()
+        }
+        activeRenameFab = null
+    }
+
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (ev.action == android.view.MotionEvent.ACTION_DOWN) {
+            val active = activeRenameFab
+            if (active != null) {
+                val xy = IntArray(2).also { active.getLocationOnScreen(it) }
+                val hit = ev.rawX >= xy[0] && ev.rawX <= xy[0] + active.width &&
+                          ev.rawY >= xy[1] && ev.rawY <= xy[1] + active.height
+                if (!hit) hideActiveRenameFab()
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun showRenameDialog(dev: com.clipsync.model.OnlineDevice) {
+        hideActiveRenameFab()
+
+        val dialog = android.app.Dialog(this, android.R.style.Theme_Translucent_NoTitleBar)
+        dialog.setCancelable(true)
+        dialog.setCanceledOnTouchOutside(true)
+
+        val pad = Design.dp(this, 20f)
+        val gap = Design.dp(this, 12f)
+
+        // 卡片容器
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Design.dp(this@MainActivity, 22f), Design.dp(this@MainActivity, 20f),
+                Design.dp(this@MainActivity, 22f), Design.dp(this@MainActivity, 18f))
+            background = Design.roundedBg(this@MainActivity, Design.Color.SURFACE, Design.Radius.CARD)
+            elevation = Design.dp(this@MainActivity, 12f).toFloat()
+            minimumWidth = Design.dp(this@MainActivity, 300f)
+        }
+
+        // 标题行：主题色圆形图标 + 标题
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val iconBadge = android.widget.FrameLayout(this).apply {
+            background = Design.circleBg(Design.Color.PRIMARY_TINT)
+            val s = Design.dp(this@MainActivity, 36f)
+            setPadding(0, 0, 0, 0)
+            addView(android.widget.TextView(this@MainActivity).apply {
+                text = "✎"
+                setTextColor(Design.Color.PRIMARY)
+                textSize = 18f
+                gravity = Gravity.CENTER
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            }, android.widget.FrameLayout.LayoutParams(s, s).apply { gravity = Gravity.CENTER })
+        }
+        titleRow.addView(iconBadge, LinearLayout.LayoutParams(
+            Design.dp(this, 36f), Design.dp(this, 36f)
+        ))
+        titleRow.addView(Design.text(this, "重命名设备", Design.Text.CARD_TITLE, Design.Color.INK, bold = true).apply {
+            setPadding(Design.dp(this@MainActivity, 10f), 0, 0, 0)
+        })
+        card.addView(titleRow)
+
+        card.addView(Design.text(this, "给这台设备起个好记的名字", Design.Text.CAPTION, Design.Color.INK_MUTED).apply {
+            setPadding(0, Design.dp(this@MainActivity, 6f), 0, 0)
+        })
+
+        // 输入框
+        val input = android.widget.EditText(this).apply {
+            setText(dev.name)
+            setSelection(text.length)
+            filters = arrayOf(android.text.InputFilter.LengthFilter(32))
+            hint = "新名称"
+            setTextColor(Design.Color.INK)
+            setHintTextColor(Design.Color.INK_DISABLED)
+            textSize = Design.Text.BODY
+            background = Design.outlinedBg(
+                this@MainActivity,
+                Design.Color.SUBTLE,
+                Design.Color.BORDER,
+                Design.Radius.INPUT,
+                1.2f
+            )
+            val ph = Design.dp(this@MainActivity, 12f)
+            val pv = Design.dp(this@MainActivity, 10f)
+            setPadding(ph, pv, ph, pv)
+        }
+        val inputLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = gap }
+        card.addView(input, inputLp)
+
+        // 错误提示
+        val errorView = Design.text(this, "", Design.Text.CAPTION, Design.Color.DANGER).apply {
+            visibility = View.GONE
+        }
+        card.addView(errorView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Design.dp(this@MainActivity, 6f) })
+
+        // 按钮行
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        val cancelBtn = android.widget.Button(this).apply {
+            text = "取消"
+            textSize = Design.Text.CAPTION
+            setTextColor(Design.Color.INK_SECONDARY)
+            isAllCaps = false
+            background = Design.roundedBg(this@MainActivity, Design.Color.SUBTLE, Design.Radius.BUTTON)
+            val ph = Design.dp(this@MainActivity, 18f)
+            val pv = Design.dp(this@MainActivity, 8f)
+            setPadding(ph, pv, ph, pv)
+            minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
+            setOnClickListener { dialog.dismiss() }
+        }
+        val saveBtn = android.widget.Button(this).apply {
+            text = "保存"
+            textSize = Design.Text.CAPTION
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(android.graphics.Color.WHITE)
+            isAllCaps = false
+            background = Design.roundedBg(this@MainActivity, Design.Color.PRIMARY, Design.Radius.BUTTON)
+            val ph = Design.dp(this@MainActivity, 22f)
+            val pv = Design.dp(this@MainActivity, 8f)
+            setPadding(ph, pv, ph, pv)
+            minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
+        }
+        btnRow.addView(cancelBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        btnRow.addView(saveBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { leftMargin = Design.dp(this@MainActivity, 8f) })
+        card.addView(btnRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Design.dp(this@MainActivity, 18f) })
+
+        fun save() {
+            val newName = input.text.toString().trim().take(32)
+            saveBtn.isEnabled = false
+            cancelBtn.isEnabled = false
+            saveBtn.text = "保存中…"
+            lifecycleScope.launch {
+                val server = getSharedPreferences("clipsync", MODE_PRIVATE)
+                    .getString("server", null) ?: BuildConfig.DEFAULT_SERVER
+                val result = runCatching {
+                    com.clipsync.net.AuthClient.renameDevice(
+                        serverUrl = server,
+                        token = com.clipsync.net.AuthClient.savedToken(this@MainActivity),
+                        deviceId = dev.deviceId,
+                        name = newName
+                    )
+                }
+                withContext(Dispatchers.Main) {
+                    result.onSuccess { dialog.dismiss() }
+                        .onFailure {
+                            errorView.text = "改名失败：${it.message}"
+                            errorView.visibility = View.VISIBLE
+                            saveBtn.isEnabled = true
+                            cancelBtn.isEnabled = true
+                            saveBtn.text = "保存"
+                        }
+                }
+            }
+        }
+        saveBtn.setOnClickListener { save() }
+
+        // 外层：半透明遮罩 + 居中卡片
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(0x66000000)
+            setPadding(pad, pad, pad, pad)
+            addView(card)
+            setOnClickListener { dialog.dismiss() }
+        }
+        card.setOnClickListener { /* 吞掉点击，防止点卡片关闭 */ }
+
+        dialog.setContentView(root)
+        dialog.window?.setLayout(
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            android.view.WindowManager.LayoutParams.MATCH_PARENT
+        )
+        dialog.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+        dialog.show()
+
+        // 弹出键盘
+        input.requestFocus()
+        dialog.window?.setSoftInputMode(
+            android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
+        )
     }
 
     private fun buildCapTag(text: String, on: Boolean): View {
@@ -714,10 +1045,16 @@ class MainActivity : AppCompatActivity() {
         ) {
             return
         }
-        // 被踢下线时显示修改密码按钮
+        // 被踢下线时根据 reason 决定是否显示"修改密码"按钮：
+        //  - 密码被重置：显示"修改密码"，弹框让用户填新密码后重连
+        //  - 其他（账号禁用、设备禁用、单纯踢一脚）：隐藏按钮，只显示提示
         val kicked = ConnectionBus.kicked
+        val kickedReason = ConnectionBus.kickedReason
+        val showChangePwd = kickedReason == ConnectionBus.KICKED_PASSWORD_RESET ||
+            kickedReason == ConnectionBus.KICKED_OTHER ||
+            (kickedReason == null && kicked)
         if (::changePwdBtn.isInitialized) {
-            changePwdBtn.visibility = if (kicked) View.VISIBLE else View.GONE
+            changePwdBtn.visibility = if (kicked && showChangePwd) View.VISIBLE else View.GONE
         }
         when (state) {
             ConnectionBus.STATE_OPEN -> {

@@ -116,6 +116,19 @@ object AuthClient {
         Unit
     }
 
+    /**
+     * POST /device/name —— 给指定设备设置自定义名称。
+     * 服务端落库后会实时广播 presence，所有在线端立即看到新名称。
+     */
+    suspend fun renameDevice(serverUrl: String, token: String, deviceId: String, name: String) =
+        withContext(Dispatchers.IO) {
+            val body = JSONObject()
+                .put("device_id", deviceId)
+                .put("name", name)
+            post(serverUrl, "/device/name", body, token)
+            Unit
+        }
+
     // ===== 本地会话存取 =====
 
     fun savedToken(ctx: Context): String =

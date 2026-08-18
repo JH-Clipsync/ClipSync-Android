@@ -74,7 +74,9 @@ data class MessagePayload(
     val kind: String? = null,      // 业务子类型：sms_code / text / image / share ...
     val sender: String? = null,    // 短信发件人（服务端清洗后填入）
     /** 加密信封；非空时 text/data 为空，真实内容在 enc.ct 里 */
-    val enc: com.clipsync.crypto.EncEnvelope? = null
+    val enc: com.clipsync.crypto.EncEnvelope? = null,
+    /** server_kick 消息的原因：password_reset / user_disabled / device_banned ... */
+    val reason: String? = null
 )
 
 @Serializable
@@ -99,11 +101,15 @@ data class OnlineDevice(
     @kotlinx.serialization.SerialName("device_id") val deviceId: String = "",
     val role: String = "",
     val platform: String = "",
+    val name: String = "",
     val ip: String = "",
     @kotlinx.serialization.SerialName("online_at") val onlineAt: Long = 0L,
     val self: Boolean = false,
     val caps: Map<String, Boolean> = emptyMap()
 ) {
+    /** 列表展示名：优先自定义名，否则平台标签 */
+    val displayName: String
+        get() = name.trim().ifEmpty { platformLabel }
     val roleLabel: String
         get() = when (role) {
             ClientRole.MOBILE -> "手机"

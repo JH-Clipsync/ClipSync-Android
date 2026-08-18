@@ -5,6 +5,7 @@ import android.content.res.Configuration
 import android.os.Bundle
 import android.text.InputType
 import android.view.View
+import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import androidx.appcompat.app.AppCompatActivity
@@ -15,6 +16,7 @@ import com.clipsync.crypto.PayloadCipher
 import com.clipsync.net.AuthClient
 import com.clipsync.net.ServerAddress
 import com.clipsync.service.SyncService
+import com.clipsync.state.ConnectionBus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -77,6 +79,8 @@ class SettingsActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshPermissionBadge()
+        com.clipsync.state.ConnectionBus.addListener(stateListener)
+        refreshQuickConnectBtn()
     }
 
     override fun onSupportNavigateUp(): Boolean {
@@ -91,6 +95,7 @@ class SettingsActivity : AppCompatActivity() {
      */
     override fun onPause() {
         super.onPause()
+        com.clipsync.state.ConnectionBus.removeListener(stateListener)
         val now = connectionSnapshot()
         if (now != connectionSnapshotAtEntry) {
             connectionSnapshotAtEntry = now
@@ -143,6 +148,53 @@ class SettingsActivity : AppCompatActivity() {
         ) { checked ->
             sp.edit().putBoolean("auto_connect", checked).apply()
         }
+
+        // 快捷操作：填完账号密码后可直接在此发起连接；已连接后隐藏（断开在主页操作）
+        SettingsRows.separator(this, card)
+        quickConnectBtn = Button(this).apply {
+            text = "立即连接"
+            setTextColor(Design.Color.INK_SECONDARY)
+            background = Design.outlinedBg(
+                this@SettingsActivity,
+                Design.Color.SURFACE,
+                Design.Color.BORDER,
+                Design.Radius.CHIP
+            )
+            textSize = Design.Text.BODY
+            setTypeface(typeface, android.graphics.Typeface.NORMAL)
+            stateListAnimator = null
+            val h = Design.dp(this@SettingsActivity, 22f)
+            val v = Design.dp(this@SettingsActivity, 9f)
+            setPadding(h, v, h, v)
+            setOnClickListener { connectFromSettings() }
+        }
+        card.addView(quickConnectBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Design.dp(this@SettingsActivity, 14f) })
+    }
+
+    private lateinit var quickConnectBtn: View
+
+    private val stateListener: (String) -> Unit = { state -> refreshQuickConnectBtn(state) }
+
+    private fun refreshQuickConnectBtn(state: String = com.clipsync.state.ConnectionBus.current) {
+        if (!::quickConnectBtn.isInitialized) return
+        val connected = state == com.clipsync.state.ConnectionBus.STATE_OPEN ||
+            SyncService.activeWs() != null
+        // 已连接就隐藏按钮：断开同步统一在主页操作，设置页只负责"填完密码快速连一下"
+        quickConnectBtn.visibility = if (connected) View.GONE else View.VISIBLE
+    }
+
+    /** 设置页内的"立即连接"：启动 SyncService。 */
+    private fun connectFromSettings() {
+        SyncService.setUserEnabled(this, true)
+        ConnectionBus.clearKicked()
+        val intent = Intent(this, SyncService::class.java).apply {
+            action = SyncService.ACTION_CONNECT
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(intent)
+        else startService(intent)
     }
 
     private fun accountSummary(): String {

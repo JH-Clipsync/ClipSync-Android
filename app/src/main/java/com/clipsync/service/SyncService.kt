@@ -16,6 +16,7 @@ import com.clipsync.MainActivity
 import com.clipsync.accessibility.ClipSyncAccessibilityService
 import com.clipsync.clipboard.ClipboardManagerHelper
 import com.clipsync.history.HistoryStore
+import com.clipsync.model.Message
 import com.clipsync.model.MessageType
 import com.clipsync.net.AuthClient
 import com.clipsync.net.WsClient
@@ -51,7 +52,9 @@ class SyncService : Service() {
         const val EXTRA_TYPE = "type"
 
         private const val CHANNEL_ID = "clipsync_fg"
+        private const val CHANNEL_ALERTS_ID = "clipsync_alerts"
         private const val NOTIFICATION_ID = 1
+        private const val PRESENCE_NOTIF_BASE = 2000
 
         @Volatile
         private var currentWs: WsClient? = null
@@ -354,13 +357,48 @@ class SyncService : Service() {
         subscribeAuthFailure(wsClient, server)
     }
 
-    /** 订阅在线设备列表，转发给 PresenceBus 供 MainActivity 展示 */
+    /** 订阅在线设备列表，转发给 PresenceBus 供 MainActivity 展示；其他设备上下线弹通知 */
     private fun subscribePresence(wsClient: WsClient) {
         serviceScope.launch {
+            var knownOthers: Map<String, com.clipsync.model.OnlineDevice>? = null
             wsClient.onlineDevices.collect { devices ->
                 com.clipsync.state.PresenceBus.publish(devices)
+
+                val newOthers = devices.filter { !it.self }.associateBy { it.deviceId }
+                val prev = knownOthers
+                if (prev != null) {
+                    val cameOnline = newOthers.keys - prev.keys
+                    val wentOffline = prev.keys - newOthers.keys
+                    cameOnline.forEach { id -> newOthers[id]?.let { showPresenceNotification(it, online = true) } }
+                    wentOffline.forEach { id -> prev[id]?.let { showPresenceNotification(it, online = false) } }
+                }
+                knownOthers = newOthers
             }
         }
+    }
+
+    private fun showPresenceNotification(device: com.clipsync.model.OnlineDevice, online: Boolean) {
+        val nm = getSystemService(NotificationManager::class.java) ?: return
+        ensureAlertsChannel()
+        val title = if (online) "设备上线" else "设备下线"
+        // 有自定义名就显示「名字 · 平台（短ID）」，没名字才 fallback 到「平台 · 短ID」
+        val customName = device.name.trim()
+        val body = if (customName.isNotEmpty()) {
+            "$customName · ${device.platformLabel}（${device.shortId}）"
+        } else {
+            "${device.platformLabel} · ${device.shortId}"
+        }
+        val action = if (online) "已连接" else "已断开"
+        val notif = NotificationCompat.Builder(this, CHANNEL_ALERTS_ID)
+            .setContentTitle(title)
+            .setContentText("$body $action")
+            .setSmallIcon(android.R.drawable.ic_menu_share)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .build()
+        val notifId = PRESENCE_NOTIF_BASE + (device.deviceId.hashCode() and 0x7fffffff) % 500
+        nm.notify(notifId, notif)
     }
 
     /**
@@ -489,10 +527,9 @@ class SyncService : Service() {
         incomingJob?.cancel()
         incomingJob = serviceScope.launch {
             wsClient.incoming.collect { msg ->
-                // 服务端踢下线通知：停止重连，提示用户修改密码
+                // 服务端踢下线通知：停止重连，提示用户
                 if (msg.type == MessageType.SERVER_KICK) {
-                    Log.w("ClipSync", "👢 收到服务端踢下线通知")
-                    handleServerKick()
+                    handleServerKick(msg)
                     return@collect
                 }
                 // Mac 端可能会用 clipboard / clipboard_text / clipboard_image 三种 type
@@ -611,15 +648,20 @@ class SyncService : Service() {
 
     /**
      * 收到服务端踢下线通知：停止 WS 重连，清除本地 token，
-     * 标记 kicked 让 UI 显示修改密码按钮。
+     * 标记 kicked 让 UI 根据 reason 显示不同提示。
      */
-    private fun handleServerKick() {
+    private fun handleServerKick(msg: Message) {
+        val reason = msg.payload.reason?.ifEmpty {
+            // 旧服务端没带 reason，按密码重置处理
+            ConnectionBus.KICKED_PASSWORD_RESET
+        } ?: ConnectionBus.KICKED_PASSWORD_RESET
+        Log.w("ClipSync", "👢 收到服务端踢下线通知 reason=$reason")
         ws?.kickStop = true
         ws?.stop()
         ws = null
         currentWs = null
         AuthClient.clearSession(this)
-        ConnectionBus.publishKicked("密码已被管理员重置，请修改密码后重新连接")
+        ConnectionBus.kicked(reason)
         val nm = getSystemService(NotificationManager::class.java)
         nm?.notify(NOTIFICATION_ID, buildNotification(ConnectionBus.STATE_CLOSED))
     }
@@ -810,6 +852,20 @@ class SyncService : Service() {
                 enableLights(false)
                 enableVibration(false)
                 lockscreenVisibility = Notification.VISIBILITY_SECRET
+            }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+        }
+    }
+
+    private fun ensureAlertsChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(
+                CHANNEL_ALERTS_ID,
+                "设备上下线提醒",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "其他设备上线或下线时的提醒"
+                setShowBadge(false)
             }
             getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
         }

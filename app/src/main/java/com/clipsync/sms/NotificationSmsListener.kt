@@ -1,7 +1,11 @@
 package com.clipsync.sms
 
 import android.app.Notification
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.provider.Telephony
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -17,6 +21,82 @@ class NotificationSmsListener : NotificationListenerService() {
 
     companion object {
         private const val TAG = "NotifSmsListener"
+
+        /**
+         * 通知监听是否真正被系统绑定。
+         * MIUI/HyperOS 在 App 重装/升级后会出现"设置里显示已授权但系统没绑定"的假开启状态，
+         * 这个标记由 onListenerConnected/Disconnected 实时更新，供 UI 检测并提示用户。
+         */
+        @Volatile
+        var isConnected: Boolean = false
+            private set
+
+        /**
+         * 最后一次收到任何通知的时间戳。
+         * MIUI/HyperOS 有个 bug：通知监听服务运行久了系统会静默停止投递通知，
+         * 但 onListenerDisconnected 不会被调用，isConnected 还停在 true。
+         * 通过这个时间戳，外部 Watchdog 可以判断监听是否"假活"并触发重绑。
+         */
+        @Volatile
+        var lastNotifyAt: Long = 0L
+            private set
+
+        /**
+         * 看门狗调用：检测监听是否可能处于 MIUI 静默断连状态。
+         * 如果已连接但超过 staleMs 没收到任何通知，认为是假活，强制重绑。
+         * 返回 true 表示已触发重绑。
+         */
+        fun checkAndRebindIfStale(ctx: Context, staleMs: Long = 10 * 60 * 1000L): Boolean {
+            if (!isConnected) {
+                ensureConnected(ctx)
+                return true
+            }
+            val idle = System.currentTimeMillis() - lastNotifyAt
+            if (idle > staleMs) {
+                Log.w(TAG, "🔍 看门狗：监听已 ${idle / 1000}s 无任何通知，疑似 MIUI 静默断连，强制重绑")
+                isConnected = false
+                ensureConnected(ctx)
+                return true
+            }
+            return false
+        }
+
+        /**
+         * 检测通知监听是否真正绑定，未绑定时尝试自动重连。
+         *
+         * 两种方式：
+         * 1. Android 7.0+ 直接调 requestRebind()，请求系统重新绑定 Listener；
+         * 2. 若 1 无效（部分 MIUI 版本），用 disable → enable 组件的方式强制系统重绑。
+         *
+         * 返回 true 表示已连接或已发起重连；false 表示重连失败，调用方应提示用户手动处理。
+         */
+        fun ensureConnected(ctx: Context): Boolean {
+            if (isConnected) return true
+            val cn = ComponentName(ctx, NotificationSmsListener::class.java)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    Log.i(TAG, "🔄 尝试 requestRebind() 重新绑定通知监听")
+                    requestRebind(cn)
+                    return true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "requestRebind 失败: ${e.message}")
+            }
+            try {
+                val pm = ctx.packageManager
+                Log.i(TAG, "🔄 尝试 toggle 组件状态重新绑定")
+                pm.setComponentEnabledSetting(cn,
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    PackageManager.DONT_KILL_APP)
+                pm.setComponentEnabledSetting(cn,
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    PackageManager.DONT_KILL_APP)
+                return true
+            } catch (e: Exception) {
+                Log.e(TAG, "toggle 组件失败: ${e.message}")
+            }
+            return false
+        }
 
         // 常见短信/通知 App 包名
         private val SMS_APPS = setOf(
@@ -55,15 +135,18 @@ class NotificationSmsListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        isConnected = true
         Log.i(TAG, "🟢 [通知监听] onListenerConnected —— 已连接，开始接收通知")
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
+        isConnected = false
         Log.w(TAG, "🔴 [通知监听] onListenerDisconnected —— 已断开")
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
+        lastNotifyAt = System.currentTimeMillis()
         // 同步未启用就不拉服务，与 SmsReceiver 保持一致。
         if (!SyncService.isUserEnabled(this)) {
             // 不打日志避免刷屏
