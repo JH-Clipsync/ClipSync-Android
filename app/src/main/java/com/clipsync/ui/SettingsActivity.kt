@@ -5,7 +5,6 @@ import android.content.res.Configuration
 import android.os.Bundle
 import android.text.InputType
 import android.view.View
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import androidx.appcompat.app.AppCompatActivity
@@ -79,8 +78,6 @@ class SettingsActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshPermissionBadge()
-        com.clipsync.state.ConnectionBus.addListener(stateListener)
-        refreshQuickConnectBtn()
     }
 
     override fun onSupportNavigateUp(): Boolean {
@@ -95,7 +92,6 @@ class SettingsActivity : AppCompatActivity() {
      */
     override fun onPause() {
         super.onPause()
-        com.clipsync.state.ConnectionBus.removeListener(stateListener)
         val now = connectionSnapshot()
         if (now != connectionSnapshotAtEntry) {
             connectionSnapshotAtEntry = now
@@ -148,52 +144,6 @@ class SettingsActivity : AppCompatActivity() {
         ) { checked ->
             sp.edit().putBoolean("auto_connect", checked).apply()
         }
-
-        // 快捷操作：填完账号密码后可直接在此发起连接（已连接则重连）。断开同步在主页操作。
-        SettingsRows.separator(this, card)
-        quickConnectBtn = Button(this).apply {
-            text = "立即连接"
-            setTextColor(Design.Color.INK_SECONDARY)
-            background = Design.outlinedBg(
-                this@SettingsActivity,
-                Design.Color.SURFACE,
-                Design.Color.BORDER,
-                Design.Radius.CHIP
-            )
-            textSize = Design.Text.BODY
-            setTypeface(typeface, android.graphics.Typeface.NORMAL)
-            stateListAnimator = null
-            val h = Design.dp(this@SettingsActivity, 22f)
-            val v = Design.dp(this@SettingsActivity, 9f)
-            setPadding(h, v, h, v)
-            setOnClickListener { connectFromSettings() }
-        }
-        card.addView(quickConnectBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = Design.dp(this@SettingsActivity, 14f) })
-    }
-
-    private lateinit var quickConnectBtn: View
-
-    private val stateListener: (String) -> Unit = { state -> refreshQuickConnectBtn(state) }
-
-    private fun refreshQuickConnectBtn(state: String = com.clipsync.state.ConnectionBus.current) {
-        if (!::quickConnectBtn.isInitialized) return
-        // 按钮始终可见：未连接是"发起连接"，已连接是"重连"
-        quickConnectBtn.visibility = View.VISIBLE
-    }
-
-    /**
-     * 设置页内的"立即连接"：
-     *  - 未连接：直接启动 SyncService 发起连接；
-     *  - 已连接 / 连接中：重启服务，让刚改的账号密码 / 服务器 / 加密设置立刻生效。
-     */
-    private fun connectFromSettings() {
-        SyncService.setUserEnabled(this, true)
-        ConnectionBus.clearKicked()
-        // 地址、账密、加密这些参数是服务启动时读的，已在运行就重启一次让新配置生效
-        SyncService.restart(this)
     }
 
     private fun accountSummary(): String {
@@ -245,6 +195,7 @@ class SettingsActivity : AppCompatActivity() {
         )
         DesignDialog.show(
             this, "账号", "账号由管理员在服务端创建，客户端不提供注册",
+            confirmLabel = "保存并连接",
             body = { col ->
                 col.addView(nameEdit, matchWrap())
                 col.addView(pwdEdit, matchWrap(Design.Space.M))
@@ -260,6 +211,11 @@ class SettingsActivity : AppCompatActivity() {
             }
             AuthClient.saveCredentials(this, name, pwd)
             accountValue.text = accountSummary()
+            // 保存后直接发起连接：填完账号密码最自然的下一步就是连上去。
+            // 已在运行就重启服务，让新账号密码 / token 立刻生效。
+            SyncService.setUserEnabled(this, true)
+            ConnectionBus.clearKicked()
+            SyncService.restart(this)
         }
     }
 

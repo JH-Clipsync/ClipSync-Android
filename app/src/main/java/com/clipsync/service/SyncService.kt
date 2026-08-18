@@ -303,6 +303,20 @@ class SyncService : Service() {
     }
 
     /**
+     * 机器级自定义设备名（存在 clipsync SharedPreferences，与登录账号无关）。
+     * 换用户登录时沿用作新账号下本机的默认名。
+     */
+    private fun localDeviceName(): String =
+        getSharedPreferences("clipsync", MODE_PRIVATE)
+            .getString("device_name", null)?.trim().orEmpty()
+
+    /** 改名成功 / presence 同步到本机新名时写回机器级存储 */
+    private fun saveLocalDeviceName(name: String) {
+        getSharedPreferences("clipsync", MODE_PRIVATE)
+            .edit().putString("device_name", name.trim()).apply()
+    }
+
+    /**
      * 读取本机同步开关，拼成上报字符串：
      *   clip_up  = 本机剪贴板变化会自动上行（upload_enabled）
      *   sms_in   = 短信同步上行（同步总开关开启即视为开启，短信由 SmsReceiver/通知监听触发）
@@ -329,11 +343,13 @@ class SyncService : Service() {
         }
 
         val deviceID = stableDeviceID()
+        // 机器级自定义设备名：换用户登录也沿用
+        val deviceName = localDeviceName()
         // 加密开启时用有效密码（用户没填就是内置默认密码）；关闭时空串走明文
         val syncPassword = com.clipsync.crypto.PayloadCipher.effectivePassword(this)
         // 本机同步开关，上报给服务端用于在线列表展示
         val caps = buildCaps()
-        val wsClient = WsClient(server, token, deviceID, syncPassword, caps).also { it.start() }
+        val wsClient = WsClient(server, token, deviceID, syncPassword, caps, deviceName).also { it.start() }
         ws = wsClient
         currentWs = wsClient
 
@@ -363,6 +379,12 @@ class SyncService : Service() {
             var knownOthers: Map<String, com.clipsync.model.OnlineDevice>? = null
             wsClient.onlineDevices.collect { devices ->
                 com.clipsync.state.PresenceBus.publish(devices)
+
+                // 本机名可能从其他端被修改：从在线列表里找到本机，同步到机器级存储
+                devices.firstOrNull { it.self }?.let { self ->
+                    val n = self.name.trim()
+                    if (n.isNotEmpty() && n != localDeviceName()) saveLocalDeviceName(n)
+                }
 
                 val newOthers = devices.filter { !it.self }.associateBy { it.deviceId }
                 val prev = knownOthers

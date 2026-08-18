@@ -42,7 +42,9 @@ class WsClient(
     /** 端到端加密的同步密码；空串表示不加密 */
     private val syncPassword: String = "",
     /** 本机同步能力/开关，逗号分隔，上报给服务端用于在线列表展示 */
-    private val caps: String = ""
+    private val caps: String = "",
+    /** 机器级自定义设备名（与登录账号无关），换用户登录时沿用 */
+    private val deviceName: String = ""
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
@@ -147,8 +149,9 @@ class WsClient(
      * 使用 CompletableDeferred 替代 Thread.sleep，确保连接失败/关闭后能正确返回并重试。
      */
     private suspend fun connectOnce() {
-        val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
-        val encodedName = java.net.URLEncoder.encode(deviceName, "UTF-8")
+        // 优先用机器级自定义名（换用户登录也沿用），为空才回退到厂商+型号
+        val effectiveName = deviceName.ifBlank { "${Build.MANUFACTURER} ${Build.MODEL}".trim() }
+        val encodedName = java.net.URLEncoder.encode(effectiveName, "UTF-8")
         var url = "$serverUrl/ws?token=$token&device=$deviceID&role=${ClientRole.MOBILE}&platform=android&name=$encodedName"
         if (caps.isNotEmpty()) url += "&caps=$caps"
         val req = Request.Builder().url(url).build()

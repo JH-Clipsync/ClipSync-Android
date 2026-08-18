@@ -888,8 +888,15 @@ class MainActivity : AppCompatActivity() {
                     )
                 }
                 withContext(Dispatchers.Main) {
-                    result.onSuccess { dialog.dismiss() }
-                        .onFailure {
+                    result.onSuccess {
+                        // 改的是本机：写入机器级存储，换用户登录时沿用
+                        val sp = getSharedPreferences("clipsync", MODE_PRIVATE)
+                        val myID = sp.getString("device_id", null)
+                        if (myID != null && myID == dev.deviceId) {
+                            sp.edit().putString("device_name", newName).apply()
+                        }
+                        dialog.dismiss()
+                    }.onFailure {
                             errorView.text = "改名失败：${it.message}"
                             errorView.visibility = View.VISIBLE
                             saveBtn.isEnabled = true
