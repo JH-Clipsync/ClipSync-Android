@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 
 /**
@@ -54,10 +55,14 @@ object PermissionStatus {
 
     /** 用户在系统设置里勾了「通知使用权」 */
     fun notificationListenerEnabled(ctx: Context): Boolean {
-        val flat = Settings.Secure.getString(
-            ctx.contentResolver, "enabled_notification_listeners"
-        ) ?: return false
-        return flat.split(":").any { it.contains(ctx.packageName) }
+        return try {
+            NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName)
+        } catch (e: Exception) {
+            val flat = Settings.Secure.getString(
+                ctx.contentResolver, "enabled_notification_listeners"
+            ) ?: return false
+            flat.split(":").any { it.contains(ctx.packageName) }
+        }
     }
 
     /**
@@ -72,6 +77,13 @@ object PermissionStatus {
         list?.any { it.packageName == ctx.packageName } == true
     } catch (e: Exception) {
         notificationListenerEnabled(ctx)
+    }
+
+    /** 综合判断通知监听是否处于可用状态：设置已开、服务已绑、或最近收到过通知 */
+    fun notificationListenerOkay(ctx: Context): Boolean {
+        if (notificationListenerLive(ctx)) return true
+        if (notificationListenerEnabled(ctx)) return true
+        return false
     }
 
     // MARK: - MIUI/HyperOS 扩展权限

@@ -31,6 +31,25 @@ class NotificationSmsListener : NotificationListenerService() {
         var isConnected: Boolean = false
             private set
 
+        private const val PREFS_NAME = "clipsync_notification_listener"
+        private const val KEY_WAS_CONNECTED = "was_connected"
+
+        /**
+         * 记录通知监听是否曾经真正连上过。
+         * MIUI/HyperOS 在用户划掉 App（进程被结束）后经常会收回通知使用权，
+         * 下次打开时 permission 会直接从设置里消失。用这个标记区分"从来没开过"和
+         * "以前开过但被系统收回"，后者可以给出更明确的"一键重新开启"引导。
+         */
+        fun wasEverConnected(ctx: Context): Boolean {
+            return ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_WAS_CONNECTED, false)
+        }
+
+        private fun setWasConnected(ctx: Context, connected: Boolean) {
+            ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_WAS_CONNECTED, connected).apply()
+        }
+
         /**
          * 最后一次收到任何通知的时间戳。
          * MIUI/HyperOS 有个 bug：通知监听服务运行久了系统会静默停止投递通知，
@@ -136,6 +155,7 @@ class NotificationSmsListener : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         isConnected = true
+        setWasConnected(this, true)
         Log.i(TAG, "🟢 [通知监听] onListenerConnected —— 已连接，开始接收通知")
     }
 

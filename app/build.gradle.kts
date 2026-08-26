@@ -23,8 +23,8 @@ android {
         applicationId = "com.clipsync"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "2026.8.7.2"
+        versionCode = 7
+        versionName = "2026.8.26.1"
 
         // 把默认配置作为 BuildConfig 常量注入到代码里
         buildConfigField("String", "DEFAULT_SERVER", "\"$defaultServer\"")

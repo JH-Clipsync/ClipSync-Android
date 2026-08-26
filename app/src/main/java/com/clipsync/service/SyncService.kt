@@ -166,6 +166,8 @@ class SyncService : Service() {
         serviceAlive = true
         Log.i("ClipSync", "🟢 同步服务已启动")
         startForeground(buildNotification(ConnectionBus.STATE_CONNECTING))
+        // 服务运行期间一直保持 CPU 唤醒，防止锁屏后系统休眠/断网导致 WebSocket 掉线。
+        // 连接建立后也不释放，因为 MIUI/HyperOS 在锁屏时经常冻结后台网络。
         acquireWakeLock()
         com.clipsync.clipboard.ScreenshotWatcher.start(this)
         watchNetwork()
@@ -207,14 +209,15 @@ class SyncService : Service() {
             "ClipSync::SyncServiceWakeLock"
         ).apply {
             setReferenceCounted(false)
-            // 10 分钟兜底：任意一次退避最多 30s，正常情况会在 releaseWakeLock
-            // 主动释放；带超时的目的是即便代码路径有 bug，也不会无限制持锁
-            acquire(10 * 60 * 1000L)
+            // 服务运行期间一直持有，锁屏也不释放。进程被杀或服务停止时系统会自动释放。
+            acquire()
         }
+        Log.i("ClipSync", "🔒 已获取 WakeLock")
     }
 
     private fun releaseWakeLock() {
         wakeLock?.let { if (it.isHeld) it.release() }
+        Log.i("ClipSync", "🔓 已释放 WakeLock")
     }
 
     private fun connectWs() {
@@ -501,13 +504,10 @@ class SyncService : Service() {
                 val nm = getSystemService(NotificationManager::class.java)
                 nm?.notify(NOTIFICATION_ID, buildNotification(state))
 
-                // 连上了立刻放 WakeLock，让系统正常休眠；
-                // 转入 CONNECTING 时重新申请，托住退避等待
+                // 连上后补发暂存短信；WakeLock 一直持有，不随连接状态释放，
+                // 避免 MIUI/HyperOS 锁屏后冻结后台网络导致掉线。
                 if (s == WsClient.State.OPEN) {
-                    releaseWakeLock()
                     flushPendingSms()
-                } else if (s == WsClient.State.CONNECTING) {
-                    acquireWakeLock()
                 }
 
                 // 断线不杀服务：WsClient 内部有指数退避自动重连，

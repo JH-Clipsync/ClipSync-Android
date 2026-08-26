@@ -81,6 +81,9 @@ class MainActivity : AppCompatActivity() {
     /** 顶部轻提示，替代会挡住底部按钮的系统 Toast */
     private lateinit var toast: com.clipsync.ui.DesignToast
 
+    /** 通知监听重绑定时检查用的 Handler，onPause 时清掉避免泄漏 */
+    private val notifCheckHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     private val stateListener: (String) -> Unit = { state ->
         renderState(state)
         // 断线/重连时刷新在线设备卡的"离线/获取中"提示
@@ -322,6 +325,7 @@ class MainActivity : AppCompatActivity() {
         // 如果在这里移除 listener，连接成功时 publish(STATE_OPEN) 就没人收，
         // 界面卡在"连接中"，必须手动切到设置再回来才刷新。
         // listener 改到 onDestroy 里移除，renderState 有 isInitialized 检查保证安全。
+        notifCheckHandler.removeCallbacksAndMessages(null)
         stopDotAnimation()
     }
 
@@ -341,10 +345,13 @@ class MainActivity : AppCompatActivity() {
 
     // MARK: - 通知监听警告条
 
+    private lateinit var notifListenerWarningText: TextView
+    private lateinit var notifListenerWarningBtn: TextView
+
     /**
-     * 构造通知监听假开启警告条。
-     * MIUI/HyperOS 上 App 重装/升级后，系统设置里显示已授权但 Listener 未实际绑定，
-     * 此时短信通知完全收不到。检测到未连接时显示此横幅，点击跳转到通知使用权设置。
+     * 构造通知监听状态警告条。
+     * MIUI/HyperOS 上 App 重装/升级/被划掉后，通知使用权经常被系统收回，
+     * 每次进 App 都要手动重开。这里给出明确的状态提示和一键跳转按钮。
      */
     private fun buildNotifListenerWarning(): View {
         return LinearLayout(this).apply {
@@ -355,39 +362,112 @@ class MainActivity : AppCompatActivity() {
                 Design.dp(this@MainActivity, 12f), Design.dp(this@MainActivity, 10f))
             isClickable = true
             visibility = View.GONE
-            setOnClickListener {
-                try {
-                    startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
-                } catch (_: Exception) {}
-            }
+            setOnClickListener { openNotificationListenerSettings() }
             val dot = View(this@MainActivity).apply {
                 background = Design.circleBg(0xFFFF9800.toInt())
             }
             addView(dot, LinearLayout.LayoutParams(Design.dp(this@MainActivity, 8f), Design.dp(this@MainActivity, 8f)))
-            val text = Design.text(
+            notifListenerWarningText = Design.text(
                 this@MainActivity,
-                "通知监听未连接，短信可能无法同步。点此去设置关闭再重新开启",
+                "通知监听未连接",
                 Design.Text.MICRO, 0xFFE65100.toInt()
             ).apply {
                 setPadding(Design.dp(this@MainActivity, 8f), 0, 0, 0)
             }
-            addView(text, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(notifListenerWarningText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            notifListenerWarningBtn = Design.text(
+                this@MainActivity,
+                "去开启",
+                Design.Text.MICRO, 0xFFE65100.toInt(), bold = true
+            ).apply {
+                gravity = Gravity.CENTER
+                background = Design.outlinedBg(
+                    this@MainActivity,
+                    0xFFFFF4E5.toInt(), 0xFFFF9800.toInt(), Design.Radius.CHIP
+                )
+                val h = Design.dp(this@MainActivity, 10f)
+                val v = Design.dp(this@MainActivity, 5f)
+                setPadding(h, v, h, v)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { openNotificationListenerSettings() }
+            }
+            addView(notifListenerWarningBtn, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = Design.dp(this@MainActivity, 8f) })
+        }
+    }
+
+    private fun openNotificationListenerSettings() {
+        try {
+            startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            } catch (_: Exception) {}
         }
     }
 
     private fun refreshNotifListenerWarning() {
         if (!::notifListenerWarning.isInitialized) return
-        if (com.clipsync.sms.NotificationSmsListener.isConnected) {
+
+        val listener = com.clipsync.sms.NotificationSmsListener
+        val permissionEnabled = com.clipsync.ui.PermissionStatus.notificationListenerEnabled(this)
+        val listenerLive = com.clipsync.ui.PermissionStatus.notificationListenerLive(this)
+        val recentlyActive = System.currentTimeMillis() - listener.lastNotifyAt < 60_000L
+        val wasConnected = listener.wasEverConnected(this)
+
+        android.util.Log.i(
+            "ClipSync",
+            "刷新通知监听状态: isConnected=${listener.isConnected}, " +
+                "permissionEnabled=$permissionEnabled, listenerLive=$listenerLive, " +
+                "recentlyActive=$recentlyActive, wasConnected=$wasConnected"
+        )
+
+        // 任意一个信号为真都认为监听可用，避免静态标记/设置缓存导致的误报
+        if (listener.isConnected || listenerLive || recentlyActive) {
             notifListenerWarning.visibility = View.GONE
             return
         }
-        // 未连接：先尝试自动重连，2.5 秒后再检查，仍未连上才提示用户
-        com.clipsync.sms.NotificationSmsListener.ensureConnected(this)
-        notifListenerWarning.postDelayed({
-            if (!com.clipsync.sms.NotificationSmsListener.isConnected) {
-                notifListenerWarning.visibility = View.VISIBLE
-            }
-        }, 2500)
+
+        if (permissionEnabled) {
+            // 设置里开关还在，只是服务没被绑定（MIUI 假开启/未重绑）
+            notifListenerWarningText.text = "通知监听服务未绑定，正在尝试自动恢复…"
+            notifListenerWarningBtn.text = "去设置"
+            notifListenerWarning.visibility = View.VISIBLE
+            listener.ensureConnected(this)
+            scheduleNotifListenerChecks()
+            return
+        }
+
+        // 设置里开关也没了：区分"曾经被收回"和"从来没开过"
+        if (wasConnected) {
+            notifListenerWarningText.text = "系统已关闭通知监听权限，短信同步可能失效，点击重新开启"
+            notifListenerWarningBtn.text = "重新开启"
+        } else {
+            notifListenerWarningText.text = "需要开启通知监听权限，才能同步短信通知"
+            notifListenerWarningBtn.text = "去开启"
+        }
+        notifListenerWarning.visibility = View.VISIBLE
+    }
+
+    /** 多次检查通知监听是否恢复，系统绑定通常需要 1~3 秒 */
+    private fun scheduleNotifListenerChecks() {
+        notifCheckHandler.removeCallbacksAndMessages(null)
+        listOf(800L, 2000L, 4000L).forEach { delay ->
+            notifCheckHandler.postDelayed({
+                if (isDestroyed || isFinishing) return@postDelayed
+                val listener = com.clipsync.sms.NotificationSmsListener
+                val live = com.clipsync.ui.PermissionStatus.notificationListenerLive(this)
+                val recentlyActive = System.currentTimeMillis() - listener.lastNotifyAt < 60_000L
+                if (listener.isConnected || live || recentlyActive) {
+                    notifListenerWarning.visibility = View.GONE
+                } else if (delay == 4000L) {
+                    notifListenerWarningText.text = "通知监听仍未恢复，请点击右侧按钮去设置关闭再打开"
+                }
+            }, delay)
+        }
     }
 
     // MARK: - 状态卡（重设计：背景随状态变色，大号圆点 + 状态文字 + 服务器地址 + 启动按钮）
