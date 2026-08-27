@@ -127,7 +127,6 @@ class SyncService : Service() {
     }
 
     private var ws: WsClient? = null
-    private var wakeLock: PowerManager.WakeLock? = null
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var incomingJob: Job? = null
     private var stateJob: Job? = null
@@ -166,9 +165,11 @@ class SyncService : Service() {
         serviceAlive = true
         Log.i("ClipSync", "🟢 同步服务已启动")
         startForeground(buildNotification(ConnectionBus.STATE_CONNECTING))
-        // 服务运行期间一直保持 CPU 唤醒，防止锁屏后系统休眠/断网导致 WebSocket 掉线。
-        // 连接建立后也不释放，因为 MIUI/HyperOS 在锁屏时经常冻结后台网络。
-        acquireWakeLock()
+        // 不再常驻持有 PARTIAL_WAKE_LOCK：永久锁会让 CPU 全程无法休眠，
+        // 被 MIUI/HyperOS 等系统的"耗电异常检测"判定为高耗电台式应用而自动杀掉。
+        // 后台保活依赖"前台服务(dataSync) + 用户把电池策略设为无限制/加入白名单"，
+        // 这两项已足以让 Doze 下网络和长连接存活；真正需要 CPU 的短时任务
+        // （处理下行剪贴板、补发短信）改为 acquireBriefWakeLock 短暂拿锁、带超时自动释放。
         com.clipsync.clipboard.ScreenshotWatcher.start(this)
         watchNetwork()
         connectWs()
@@ -201,23 +202,20 @@ class SyncService : Service() {
             .onFailure { Log.w("ClipSync", "✗ 网络监听注册失败: ${it.message}") }
     }
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "ClipSync::SyncServiceWakeLock"
-        ).apply {
-            setReferenceCounted(false)
-            // 服务运行期间一直持有，锁屏也不释放。进程被杀或服务停止时系统会自动释放。
-            acquire()
-        }
-        Log.i("ClipSync", "🔒 已获取 WakeLock")
-    }
-
-    private fun releaseWakeLock() {
-        wakeLock?.let { if (it.isHeld) it.release() }
-        Log.i("ClipSync", "🔓 已释放 WakeLock")
+    /**
+     * 短暂获取 PARTIAL_WAKE_LOCK，保证一小段关键工作（如处理下行消息、补发短信）
+     * 在 Doze/息屏期间能跑完；[timeoutMs] 后由系统强制释放，绝不常驻。
+     *
+     * 每次新建一把独立、非引用计数的锁，用完即可被 GC/超时回收，
+     * 避免旧版"一把永久锁持有整个服务生命周期"导致的持续耗电与被杀。
+     */
+    private fun acquireBriefWakeLock(tag: String, timeoutMs: Long) {
+        runCatching {
+            val pm = getSystemService(POWER_SERVICE) as? PowerManager
+            val lock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ClipSync::$tag")
+            lock?.setReferenceCounted(false)
+            lock?.acquire(timeoutMs)
+        }.onFailure { Log.w("ClipSync", "✗ 获取短时 WakeLock 失败: ${it.message}") }
     }
 
     private fun connectWs() {
@@ -504,9 +502,10 @@ class SyncService : Service() {
                 val nm = getSystemService(NotificationManager::class.java)
                 nm?.notify(NOTIFICATION_ID, buildNotification(state))
 
-                // 连上后补发暂存短信；WakeLock 一直持有，不随连接状态释放，
-                // 避免 MIUI/HyperOS 锁屏后冻结后台网络导致掉线。
+                // 连上后补发暂存短信：短暂拿锁保证补发动作在息屏时跑完（15s 超时自动释放）。
+                // 后台常驻不再依赖 WakeLock，而靠前台服务 + 电池白名单维持长连接。
                 if (s == WsClient.State.OPEN) {
+                    acquireBriefWakeLock("FlushSms", 15_000L)
                     flushPendingSms()
                 }
 
@@ -554,6 +553,9 @@ class SyncService : Service() {
                     handleServerKick(msg)
                     return@collect
                 }
+                // 息屏/Doze 下收到下行消息：短暂唤醒 CPU 保证剪贴板写入/通知能跑完，
+                // 10s 超时自动释放，避免常驻 WakeLock 带来的耗电杀进程
+                acquireBriefWakeLock("IncomingMsg", 10_000L)
                 // Mac 端可能会用 clipboard / clipboard_text / clipboard_image 三种 type
                 val isClipboardMsg = msg.type == MessageType.CLIPBOARD ||
                     msg.type.startsWith("clipboard")
@@ -844,8 +846,7 @@ class SyncService : Service() {
         ws?.stop()
         ws = null
         currentWs = null
-        releaseWakeLock()
-        wakeLock = null
+        // 短时 WakeLock 都带超时自动释放，服务销毁时无需手动 release
         // 保留已有的失败原因（stopWithReason 刚设过），用户主动停止时它是 null
         ConnectionBus.publish(ConnectionBus.STATE_CLOSED, ConnectionBus.failureReason)
         super.onDestroy()
