@@ -173,6 +173,16 @@ class SyncService : Service() {
         com.clipsync.clipboard.ScreenshotWatcher.start(this)
         watchNetwork()
         connectWs()
+        // 通知监听兜底重绑：服务起来时本进程一定活着，此时调 requestRebind()
+        // 系统最容易把 NotificationSmsListener 绑定上来。MIUI 杀进程后绑定会丢失，
+        // 光靠用户回前台触发不可靠（且旧逻辑误判已连接会跳过），这里不依赖 UI。
+        // 权限没开时 ensureConnected 内部 requestRebind 会被系统忽略，无副作用。
+        serviceScope.launch {
+            kotlinx.coroutines.delay(1500)
+            runCatching {
+                com.clipsync.sms.NotificationSmsListener.ensureConnected(this@SyncService)
+            }
+        }
     }
 
     /**

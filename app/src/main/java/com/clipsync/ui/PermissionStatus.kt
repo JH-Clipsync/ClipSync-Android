@@ -68,6 +68,12 @@ object PermissionStatus {
     /**
      * 监听服务是否真的被系统绑定上了。
      * 只看 enabled 不够：MIUI 会拦截绑定请求，勾了开关但服务没连上。
+     *
+     * 注意：getActiveNotificationListeners 是隐藏 API，在 MIUI/HyperOS 上反射经常
+     * 直接抛 NoSuchMethodException。旧代码在 catch 里乐观回退成 notificationListenerEnabled()
+     * （只看权限开关，权限在就返回 true），导致"权限在但服务没绑定"时误判为已连接，
+     * UI 直接跳过 requestRebind 重绑，通知监听永远恢复不了。
+     * 拿不到真实绑定状态时必须保守返回 false，让调用方去触发重绑。
      */
     fun notificationListenerLive(ctx: Context): Boolean = try {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE)
@@ -76,7 +82,8 @@ object PermissionStatus {
         val list = method.invoke(nm) as? List<ComponentName>
         list?.any { it.packageName == ctx.packageName } == true
     } catch (e: Exception) {
-        notificationListenerEnabled(ctx)
+        // 反射失败：无法确认真实绑定状态，保守返回 false（不是回退到 enabled！）
+        false
     }
 
     /** 综合判断通知监听是否处于可用状态：设置已开、服务已绑、或最近收到过通知 */

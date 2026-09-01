@@ -31,6 +31,10 @@ class KeepAliveJobService : JobService() {
             } else {
                 startService(intent)
             }
+            // 服务被杀往往伴随通知监听绑定丢失，一并请求重绑（幂等）
+            runCatching {
+                com.clipsync.sms.NotificationSmsListener.ensureConnected(this)
+            }
         } else {
             Log.i("ClipSync", "✓ 同步服务正常运行，无需拉起")
         }

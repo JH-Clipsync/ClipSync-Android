@@ -473,14 +473,26 @@ class MainActivity : AppCompatActivity() {
                 "recentlyActive=$recentlyActive, wasConnected=$wasConnected"
         )
 
-        // 任意一个信号为真都认为监听可用，避免静态标记/设置缓存导致的误报
-        if (listener.isConnected || listenerLive || recentlyActive) {
+        // 是否真正绑定：以 NotificationListenerService 的实时回调状态为准
+        // （isConnected 由 onListenerConnected/Disconnected 维护，最可靠）。
+        // listenerLive 走隐藏 API 反射，MIUI 上拿不到真实状态，只作辅助；
+        // recentlyActive 表示最近 60s 真的收到过通知。
+        // 三者有一为真才认为监听可用——避免"权限在但服务没绑定"时误判正常、
+        // 从而跳过 requestRebind，导致通知监听永远恢复不了。
+        val actuallyConnected = listener.isConnected || listenerLive || recentlyActive
+        if (actuallyConnected) {
             notifListenerWarning.visibility = View.GONE
+            // 即便 UI 不告警，只要静态状态是未连接就补一次重绑，幂等无副作用
+            if (!listener.isConnected && permissionEnabled) {
+                listener.ensureConnected(this)
+            }
             return
         }
 
         if (permissionEnabled) {
-            // 设置里开关还在，只是服务没被绑定（MIUI 假开启/未重绑）
+            // 设置里开关还在，只是服务没被绑定（MIUI 杀进程后绑定丢失 / 未重绑）。
+            // 这里必须真正触发 requestRebind：旧逻辑因 listenerLive 误判为 true 而
+            // 提前 return，ensureConnected 从来没被调用，监听一直恢复不了。
             notifListenerWarningText.text = "通知监听服务未绑定，正在尝试自动恢复…"
             notifListenerWarningBtn.text = "去设置"
             notifListenerWarning.visibility = View.VISIBLE
@@ -503,7 +515,12 @@ class MainActivity : AppCompatActivity() {
     /** 多次检查通知监听是否恢复，系统绑定通常需要 1~3 秒 */
     private fun scheduleNotifListenerChecks() {
         notifCheckHandler.removeCallbacksAndMessages(null)
-        listOf(800L, 2000L, 4000L).forEach { delay ->
+        // 复查点要覆盖完整的自动重绑流程：
+        // requestRebind 在调用后立即尝试；若 MIUI 静默无效，3s 后降级到组件 toggle，
+        // toggle(disable→enable) + 系统重新绑定 + onListenerConnected 回调约需 3.5~5s。
+        // 旧逻辑只在 0.8/2/4s 复查，4s 时 toggle 往往刚完成、绑定回调还没到，
+        // 会误判为"仍未恢复"并定格警告条。这里延长并加密到 10s 兜底。
+        listOf(800L, 2000L, 4000L, 6000L, 8000L, 10_000L).forEach { delay ->
             notifCheckHandler.postDelayed({
                 if (isDestroyed || isFinishing) return@postDelayed
                 val listener = com.clipsync.sms.NotificationSmsListener
@@ -511,7 +528,7 @@ class MainActivity : AppCompatActivity() {
                 val recentlyActive = System.currentTimeMillis() - listener.lastNotifyAt < 60_000L
                 if (listener.isConnected || live || recentlyActive) {
                     notifListenerWarning.visibility = View.GONE
-                } else if (delay == 4000L) {
+                } else if (delay == 10_000L) {
                     notifListenerWarningText.text = "通知监听仍未恢复，请点击右侧按钮去设置关闭再打开"
                 }
             }, delay)

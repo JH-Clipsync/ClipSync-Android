@@ -83,38 +83,96 @@ class NotificationSmsListener : NotificationListenerService() {
         /**
          * 检测通知监听是否真正绑定，未绑定时尝试自动重连。
          *
-         * 两种方式：
-         * 1. Android 7.0+ 直接调 requestRebind()，请求系统重新绑定 Listener；
-         * 2. 若 1 无效（部分 MIUI 版本），用 disable → enable 组件的方式强制系统重绑。
+         * 重连有两级：
+         * 1. Android 7.0+ 调 requestRebind()，AOSP/多数 ROM 上有效；
+         * 2. 但在 MIUI/HyperOS 上 requestRebind() 会静默无效（不抛异常、也不绑定），
+         *    实测即使调用成功系统也不回调 onListenerConnected。
+         *
+         * 旧代码 requestRebind 一旦没抛异常就 return，第 2 级永远走不到，
+         * 导致 MIUI 上通知监听一旦解绑就再也恢复不了。这里改成：requestRebind 后
+         * 延迟复查 isConnected，仍未绑定则自动降级到"disable→enable 组件"强制重绑，
+         * 并做时间节流，避免反复 toggle。
          *
          * 返回 true 表示已连接或已发起重连；false 表示重连失败，调用方应提示用户手动处理。
          */
         fun ensureConnected(ctx: Context): Boolean {
             if (isConnected) return true
             val cn = ComponentName(ctx, NotificationSmsListener::class.java)
+            // 第一级：requestRebind
+            var requested = false
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     Log.i(TAG, "🔄 尝试 requestRebind() 重新绑定通知监听")
                     requestRebind(cn)
-                    return true
+                    requested = true
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "requestRebind 失败: ${e.message}")
+                Log.w(TAG, "requestRebind 抛异常: ${e.message}")
             }
-            try {
+            // 延迟 3s 复查：若 requestRebind 在 MIUI 上静默无效，降级到组件 toggle
+            scheduleRebindVerify(ctx, requested)
+            // requestRebind 不可用（< Android 7）时立刻走 toggle
+            if (!requested) {
+                return forceRebindViaToggle(ctx)
+            }
+            return true
+        }
+
+        /** 上次强制 toggle 的时间，节流用（系统绑定有开销，不能频繁操作） */
+        @Volatile
+        private var lastToggleAt: Long = 0L
+        private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+        /**
+         * requestRebind 后延迟复查；仍未绑定则降级到组件 toggle。
+         * 用主线程 Handler 延迟，不阻塞调用方；节流 20s 最多一次 toggle。
+         */
+        private fun scheduleRebindVerify(ctx: Context, didRequestRebind: Boolean) {
+            mainHandler.postDelayed({
+                if (isConnected) {
+                    Log.i(TAG, "✅ requestRebind 生效，通知监听已连接")
+                    return@postDelayed
+                }
+                Log.w(TAG, "⚠️ requestRebind 后仍未绑定（MIUI 静默无效），降级到组件 toggle 强制重绑")
+                // 节流：20s 内只 toggle 一次
+                val now = System.currentTimeMillis()
+                if (now - lastToggleAt < 20_000L) {
+                    Log.i(TAG, "⏸ 距上次 toggle 不足 20s，跳过")
+                    return@postDelayed
+                }
+                lastToggleAt = now
+                forceRebindViaToggle(ctx)
+            }, 3_000L)
+        }
+
+        /**
+         * 第二级重绑：把 Listener 组件 disable 再 enable，强制系统解除旧绑定并重新 bindService。
+         * 这是不依赖 requestRebind 的兜底手段；部分 MIUI 版本上唯一有效。
+         */
+        private fun forceRebindViaToggle(ctx: Context): Boolean {
+            val cn = ComponentName(ctx, NotificationSmsListener::class.java)
+            return try {
                 val pm = ctx.packageManager
-                Log.i(TAG, "🔄 尝试 toggle 组件状态重新绑定")
+                Log.i(TAG, "🔄 toggle 组件状态强制重绑（disable→enable）")
                 pm.setComponentEnabledSetting(cn,
                     PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
                     PackageManager.DONT_KILL_APP)
-                pm.setComponentEnabledSetting(cn,
-                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                    PackageManager.DONT_KILL_APP)
-                return true
+                // 稍作延迟再 enable，确保系统处理了 disable
+                mainHandler.postDelayed({
+                    try {
+                        pm.setComponentEnabledSetting(cn,
+                            PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                            PackageManager.DONT_KILL_APP)
+                        Log.i(TAG, "🔄 组件已重新 enable，等待系统绑定")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "重新 enable 组件失败: ${e.message}")
+                    }
+                }, 500L)
+                true
             } catch (e: Exception) {
-                Log.e(TAG, "toggle 组件失败: ${e.message}")
+                Log.e(TAG, "toggle 组件失败（可能被 MIUI 限制）: ${e.message}")
+                false
             }
-            return false
         }
 
         // 常见短信/通知 App 包名
