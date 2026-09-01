@@ -76,6 +76,13 @@ class PermissionSettingsActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         render()
+        // 权限开着但监听没绑上（MIUI 杀进程后常见）：进页面就自动重绑并定时刷新，
+        // 不用等用户点"重新触发绑定"。ensureConnected 内部有节流，重复调用安全。
+        if (PermissionStatus.notificationListenerEnabled(this) &&
+            !PermissionStatus.notificationListenerConnected(this)) {
+            runCatching { com.clipsync.sms.NotificationSmsListener.ensureConnected(this) }
+            scheduleRebindRefresh()
+        }
     }
 
     override fun onSupportNavigateUp(): Boolean {
@@ -220,7 +227,7 @@ class PermissionSettingsActivity : AppCompatActivity() {
         }
 
         val notifEnabled = PermissionStatus.notificationListenerEnabled(this)
-        val notifLive = PermissionStatus.notificationListenerLive(this)
+        val notifLive = PermissionStatus.notificationListenerConnected(this)
         hintCard.visibility = if (notifEnabled && !notifLive) View.VISIBLE else View.GONE
     }
 
@@ -421,16 +428,32 @@ class PermissionSettingsActivity : AppCompatActivity() {
      * 手动「关掉再打开」通知使用权开关也是同样效果。
      */
     private fun rebindNotificationListener() {
-        val cn = ComponentName(this, com.clipsync.sms.NotificationSmsListener::class.java)
-        try {
-            // requestRebind 在 API 25+ 存在，但部分系统对第三方隐藏，只能反射
-            val service = getSystemService(Context.NOTIFICATION_SERVICE)
-            val method = service.javaClass.getMethod("requestRebind", ComponentName::class.java)
-            method.invoke(service, cn)
-            toast("已请求重新绑定，几秒后回来看状态", Design.Color.NEUTRAL)
+        // 统一走 NotificationSmsListener.ensureConnected：它先 requestRebind，
+        // 3s 后复查仍未绑定会自动降级到 disable→enable 组件 toggle 强制重绑
+        // （MIUI 上 requestRebind 静默无效，只有 toggle 能真正触发绑定）。
+        val ok = try {
+            com.clipsync.sms.NotificationSmsListener.ensureConnected(this)
         } catch (e: Exception) {
+            false
+        }
+        if (ok) {
+            toast("正在重新绑定，几秒后自动刷新状态", Design.Color.NEUTRAL)
+            scheduleRebindRefresh()
+        } else {
             openNotificationListenerSettings()
             toast("请把 ClipSync 的通知使用权开关关掉再打开", Design.Color.NEUTRAL)
+        }
+    }
+
+    /** 重绑后定时重画页面，绑定成功（约 3~5s）后"通知监听已连接"自动变绿 */
+    private val rebindHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private fun scheduleRebindRefresh() {
+        rebindHandler.removeCallbacksAndMessages(null)
+        listOf(1000L, 2500L, 4000L, 6000L, 8000L).forEach { d ->
+            rebindHandler.postDelayed({
+                if (isDestroyed || isFinishing) return@postDelayed
+                render()
+            }, d)
         }
     }
 

@@ -86,9 +86,30 @@ object PermissionStatus {
         false
     }
 
+    /**
+     * 通知监听是否真正可用——这是给 UI 判状态用的"以事实为准"的综合判断。
+     *
+     * 三档信号，任一为真即视为已连接：
+     * 1. NotificationSmsListener.isConnected：本进程内 onListenerConnected/Disconnected
+     *    回调维护的实时状态，同进程下最可靠（权限页、首页都在同一进程）；
+     * 2. notificationListenerLive()：反射隐藏 API 查系统已绑定 listener 列表，
+     *    MIUI 上常反射失败返回 false，仅作辅助；
+     * 3. 最近 60s 真的收到过通知（lastNotifyAt），说明监听实实在在在工作。
+     *
+     * 旧代码只认第 2 档，MIUI 上它恒为 false，导致服务其实已绑定、首页短信标签
+     * 已变绿，权限页却一直显示"通知监听已连接"未就绪（卡在 5/6）。
+     */
+    fun notificationListenerConnected(ctx: Context): Boolean {
+        if (com.clipsync.sms.NotificationSmsListener.isConnected) return true
+        if (notificationListenerLive(ctx)) return true
+        val recentlyActive = System.currentTimeMillis() -
+            com.clipsync.sms.NotificationSmsListener.lastNotifyAt < 60_000L
+        return recentlyActive
+    }
+
     /** 综合判断通知监听是否处于可用状态：设置已开、服务已绑、或最近收到过通知 */
     fun notificationListenerOkay(ctx: Context): Boolean {
-        if (notificationListenerLive(ctx)) return true
+        if (notificationListenerConnected(ctx)) return true
         if (notificationListenerEnabled(ctx)) return true
         return false
     }
@@ -169,7 +190,7 @@ object PermissionStatus {
         val base = mutableListOf(
             Item("短信与通知权限", hasRuntimePermissions(ctx), "读取短信内容、发送本机通知"),
             Item("通知使用权", notificationListenerEnabled(ctx), "绕开厂商的短信广播拦截"),
-            Item("通知监听已连接", notificationListenerLive(ctx), "服务真正被系统绑定，短信才会触发"),
+            Item("通知监听已连接", notificationListenerConnected(ctx), "服务真正被系统绑定，短信才会触发"),
             Item("电池策略无限制", batteryUnrestricted(ctx), "防止后台被系统冻结")
         )
         if (isMiui()) {
