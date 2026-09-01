@@ -101,6 +101,13 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- 兜底保活：每 15 分钟检查一次 SyncService 是否存活，被系统杀掉就拉起来 -->
+        <service
+            android:name=".service.KeepAliveJobService"
+            android:enabled="true"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
         <!-- 通知监听服务：绕开 MIUI 的短信广播拦截，读取短信通知内容 -->
         <service
             android:name=".sms.NotificationSmsListener"

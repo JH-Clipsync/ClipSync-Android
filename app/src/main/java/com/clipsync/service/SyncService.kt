@@ -705,6 +705,10 @@ class SyncService : Service() {
                 // 持久化队列里的短信：冷启动时由 SmsReceiver 写入。
                 // 先全部挪到内存队列，清空持久化；再根据 ws 连接情况决定立即发 or 等连上后发。
                 // 这样"拉起服务失败→下次 App 打开"也能补发，不会永远留在磁盘里。
+                // 冷启动时换 token + 握手可能耗时十几秒，这段时间发生在 OPEN 之前、
+                // 拿不到 OPEN 后的 FlushSms 锁，Doze 下 CPU 睡着会让短信卡死在半路，
+                // 所以从入口就先持一把 30s 的锁覆盖整个建连过程。
+                acquireBriefWakeLock("FlushSmsCold", 30_000L)
                 val items = com.clipsync.sms.PendingSmsQueue.load(this)
                 if (items.isNotEmpty()) {
                     com.clipsync.sms.PendingSmsQueue.clear(this)
@@ -731,6 +735,10 @@ class SyncService : Service() {
                 }
             }
             ACTION_SEND_SMS_CODE -> {
+                // 通知监听直传路径（MIUI/HyperOS 上短信广播常被拦截，主要走这条）。
+                // 息屏 Doze 下 onStartCommand 拿到 CPU 后随时可能再睡，发送/入队/写历史
+                // 都需要 CPU 在场；冷启动时还要覆盖换 token + 握手，故入口即持 30s 锁。
+                acquireBriefWakeLock("SendSms", 30_000L)
                 val text = intent.getStringExtra(EXTRA_TEXT) ?: return START_STICKY
                 val preview = intent.getStringExtra(EXTRA_PREVIEW) ?: "短信验证码"
                 val wsClient = ws
@@ -740,6 +748,9 @@ class SyncService : Service() {
                     // 内部已有离线队列，这里再存一份会导致补发两遍）
                     synchronized(pendingSms) { pendingSms.add(text to preview) }
                     Log.i("ClipSync", "↑ 上传短信: ${text.take(40)} → 连接未就绪，已暂存等待补发")
+                    // 主动拉起连接：服务若被系统冻结后靠通知监听解冻，ws 可能一直是 null，
+                    // 不触发 connectWs() 就只能干等下一次 OPEN，短信会长期卡住
+                    connectWs()
                 } else {
                     val sent = wsClient.send(
                         type = MessageType.NOTIFY_PC,

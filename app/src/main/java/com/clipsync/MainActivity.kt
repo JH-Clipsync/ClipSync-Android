@@ -283,18 +283,23 @@ class MainActivity : AppCompatActivity() {
         renderTarget()
         refreshNotifListenerWarning()
         com.clipsync.clipboard.ClipboardManagerHelper.onForeground()
-        // 不要在回前台时偷偷拉起服务：用户没点过「启动」就让它空着。
-        // 仅在服务还活着时踢一脚加速重连。SyncService 自己是前台服务 + START_STICKY，
-        // 切后台不会被杀、断了也会自己指数退避重连，所以无需 App 介入。
+        // 锁屏时间长了系统可能把进程杀掉。这里做两件事：
+        // 1) 如果用户曾开启同步但服务死了，直接拉起来（配合 JobScheduler 兜底保活）
+        // 2) 服务还活着就踢一脚加速重连
+        // 注意：不能因为服务没起就把 sync_enabled 清成 false，否则我们刚做的
+        // 所有后台保活都会被这行代码废掉。
         if (SyncService.isServiceAlive()) {
             SyncService.kick()
-        } else {
-            // 服务没起：用户划进程 / 主动停止后回到这里。把 sync_enabled 清掉，
-            // 否则一条短信又会把服务拉起来。点「启动同步」时再写回 true。
-            // 注意：判断依据必须是"服务实例是否存活"，而不是 activeWs()——
-            // 刚点启动时服务正在换 token，activeWs() 还是 null，若在这里清标记，
-            // 连接建好后短信同步就被永久关掉了（只能再手动点一次启动）。
-            SyncService.setUserEnabled(this, false)
+        } else if (SyncService.isUserEnabled(this)) {
+            android.util.Log.i("ClipSync", "🔁 检测到同步服务未运行，回前台时自动拉起")
+            val intent = Intent(this, SyncService::class.java).apply {
+                action = SyncService.ACTION_CONNECT
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
         }
         ClipboardManagerHelper.addPreviewListener(previewListener)
         // 第一次预览（窗口未获焦点，可能读不到内容，下面 onWindowFocusChanged 会再读）
@@ -305,6 +310,8 @@ class MainActivity : AppCompatActivity() {
         clipCard.postDelayed({ refreshClipPreview() }, 1500)
         renderState(ConnectionBus.current)
         autoConnectIfNeeded()
+        // 提示用户把 App 加入电池优化白名单，MIUI 锁屏杀进程主要靠这个拦
+        promptIgnoreBatteryOptimizationIfNeeded()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -314,6 +321,47 @@ class MainActivity : AppCompatActivity() {
             // 关键：Android 10+ 后台无法读剪贴板内容，必须等窗口真正获焦点后再读。
             // 多数 ROM 还需要再延迟一帧（MIUI 更严格）
             clipCard.postDelayed({ refreshClipPreview() }, 150)
+        }
+    }
+
+    /**
+     * 如果 App 还在电池优化名单里，提示用户加入白名单。
+     * 这是 Android 6+ 官方提供的后台保活入口，MIUI/HyperOS 锁屏长时间杀进程
+     * 主要就是因为没开这个。只在用户开启过同步后提示一次，不再反复打扰。
+     */
+    private fun promptIgnoreBatteryOptimizationIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        if (!SyncService.isUserEnabled(this)) return
+        val sp = getSharedPreferences("clipsync_battery", MODE_PRIVATE)
+        if (sp.getBoolean("battery_prompt_dismissed", false)) return
+
+        val pm = getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            sp.edit().putBoolean("battery_prompt_dismissed", true).apply()
+            return
+        }
+
+        // 只在同步真正跑起来后再弹，避免第一次打开就骚扰
+        if (!SyncService.isServiceAlive()) return
+
+        com.clipsync.ui.DesignDialog.show(
+            this,
+            "后台保活提示",
+            "为避免锁屏后系统杀掉同步服务，建议把 ClipSync 加入电池优化白名单。\n\n" +
+                "点击「去设置」→ 在系统页面中选择「不优化」/「无限制」即可。",
+            confirmLabel = "去设置",
+        ) {
+            try {
+                val intent = Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                ).apply { data = android.net.Uri.parse("package:$packageName") }
+                startActivity(intent)
+            } catch (_: Exception) {
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                } catch (_: Exception) {}
+            }
+            sp.edit().putBoolean("battery_prompt_dismissed", true).apply()
         }
     }
 
