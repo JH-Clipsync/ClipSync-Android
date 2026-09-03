@@ -42,6 +42,12 @@
             android:parentActivityName=".MainActivity"
             android:label="设置" />
 
+        <!-- 全屏图片查看器：半透明黑底覆盖，不带 ActionBar -->
+        <activity
+            android:name=".ui.ImageViewerActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
         <activity
             android:name=".ui.PermissionSettingsActivity"
             android:exported="false"

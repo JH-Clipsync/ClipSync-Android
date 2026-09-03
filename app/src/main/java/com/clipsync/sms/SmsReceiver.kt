@@ -48,7 +48,7 @@ class SmsReceiver : BroadcastReceiver() {
         }
         if (body.isBlank()) { pr.finish(); return }
 
-        val fullText = "【$fromNumber】$body"
+        val fullText = SmsDatabasePoller.composeSmsText(fromNumber, body)
         val preview = "来自 $fromNumber 的短信"
 
         if (!SmsDeduplicator.shouldUpload(fromNumber, isPlaintext = true)) {

@@ -67,7 +67,7 @@ class HistoryActivity : AppCompatActivity() {
         stack.addView(emptyView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = Gravity.CENTER_HORIZONTAL })
+        ).apply { gravity = Gravity.CENTER })
         root.addView(stack, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
         ))
@@ -76,7 +76,13 @@ class HistoryActivity : AppCompatActivity() {
         applyFilter(FILTER_ALL)
 
         listView.setOnItemClickListener { _, _, position, _ ->
-            copyItem((listView.adapter as HistoryAdapter).getItem(position))
+            val item = (listView.adapter as HistoryAdapter).getItem(position)
+            // 图片：点击打开全屏查看器（可在里面复制/分享），不再直接复制
+            if (item.kind == "image" && item.imageName.isNotEmpty()) {
+                ImageViewerActivity.open(this, item.imageName)
+            } else {
+                copyItem(item)
+            }
         }
     }
 
@@ -151,7 +157,6 @@ class HistoryActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             visibility = View.GONE
-            setPadding(0, Design.dp(this@HistoryActivity, 72f), 0, 0)
         }
         col.addView(View(this).apply {
             background = Design.circleBg(Design.Color.NEUTRAL_TINT)
@@ -160,13 +165,26 @@ class HistoryActivity : AppCompatActivity() {
         ))
         col.addView(
             Design.text(this, "暂无记录", Design.Text.CARD_TITLE, Design.Color.INK_SECONDARY).apply {
+                gravity = Gravity.CENTER
                 setPadding(0, Design.dp(this@HistoryActivity, Design.Space.L), 0, 0)
-            }
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
         )
         col.addView(
-            Design.text(this, "同步过的短信和剪贴板会出现在这里", Design.Text.MICRO, Design.Color.INK_MUTED).apply {
+            Design.text(
+                this, "同步过的短信和剪贴板会出现在这里",
+                Design.Text.MICRO, Design.Color.INK_MUTED
+            ).apply {
+                gravity = Gravity.CENTER
                 setPadding(0, Design.dp(this@HistoryActivity, 6f), 0, 0)
-            }
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
         )
         return col
     }
@@ -369,7 +387,7 @@ class HistoryActivity : AppCompatActivity() {
         }
 
         holder.body.text = when {
-            item.kind == "image" && bitmap != null -> "图片 · 点击复制"
+            item.kind == "image" && bitmap != null -> "图片 · 点击查看大图"
             item.kind == "image" -> item.preview.ifEmpty { "图片已失效" }
             else -> item.text
         }

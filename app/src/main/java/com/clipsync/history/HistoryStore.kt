@@ -57,9 +57,31 @@ object HistoryStore {
         clearClip(ctx)
     }
 
+    /**
+     * 同内容短窗口去重：2 分钟内相同正文 + 相同方向的记录视为同一条。
+     *
+     * 短信上行有两条路径（SMS 广播 + 通知监听），两者会各自写一次历史；
+     * 磁盘待发队列按正文去重挡掉了重复发送，但本地历史在这一层之前写入，
+     * 仍可能出现同一条短信两条记录。Mac 端按消息 id 去重，补发的同 id
+     * 消息也在这里先按 id 替换，避免历史里堆重复条目。
+     */
+    private const val DEDUP_WINDOW_MS = 120_000L
+
     private fun append(ctx: Context, key: String, item: HistoryItem) {
         val list = read(ctx, key).toMutableList()
-        list.add(0, item) // 新的放最前面
+        val sameIdIdx = list.indexOfFirst { it.id == item.id }
+        if (sameIdIdx >= 0) {
+            // 1) 同 id 直接替换（消息重发场景）
+            list[sameIdIdx] = item
+        } else {
+            // 2) 短时间窗口内同正文同方向，视为重复，不重复插入
+            val itemMs = millisOf(item.ts)
+            val dup = list.any {
+                it.text.isNotEmpty() && it.text == item.text && it.direction == item.direction &&
+                    kotlin.math.abs(millisOf(it.ts) - itemMs) < DEDUP_WINDOW_MS
+            }
+            if (!dup) list.add(0, item) // 新的放最前面
+        }
         while (list.size > MAX_SIZE) list.removeAt(list.size - 1)
         write(ctx, key, list)
     }

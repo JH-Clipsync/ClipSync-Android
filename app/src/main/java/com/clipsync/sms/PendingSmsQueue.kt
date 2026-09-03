@@ -2,27 +2,46 @@ package com.clipsync.sms
 
 import android.content.Context
 import org.json.JSONArray
+import java.util.UUID
 
 /**
  * 待发短信的持久化队列。
  *
- * SmsReceiver.onReceive 只有 ~10s 生命周期，而且 MIUI/HyperOS 会在划掉 App 后
- * 拒绝后台 Service 冷启动。为了验证码永远不丢：
- * 1) SmsReceiver 第一时间把短信写进这个队列（SharedPreferences，进程被杀也留着）
- * 2) 然后 goAsync().finish()，广播接收器安全退出
- * 3) 之后不管是 Service 成功启动还是用户重新打开 App，任何路径只要看到队列非空
- *    就会先 flush 出去，然后清空队列
+ * 短信（无论来自 SMS 广播还是通知监听）在进入网络发送前先落盘，
+ * 只有在"连接双向通畅"持续 75s 后才把对应条目删掉。这样在息屏 Doze、
+ * 半开连接、进程被冻结等场景下短信都不会丢，恢复后自动补发；
+ * 每条短信带稳定 id，补发时消息 id 不变，Mac/Windows 端按 id 去重，
+ * 补发不会产生重复弹窗。
  */
 object PendingSmsQueue {
 
     private const val PREF = "clipsync_pending_sms"
     private const val KEY = "queue"
 
-    data class Item(val text: String, val preview: String, val ts: Long)
+    /** 队列上限：超过丢最旧的，避免长期离线无限积压 */
+    private const val MAX_ITEMS = 100
 
+    /** 同一正文在此时长内不重复入队（广播和通知监听可能各报一次同一条短信） */
+    private const val DEDUP_WINDOW_MS = 60_000L
+
+    data class Item(
+        val id: String,
+        val text: String,
+        val preview: String,
+        val ts: Long
+    )
+
+    /**
+     * 入队。自动补 id（旧版无 id 数据在 load 时补齐），并在同正文短时间内去重。
+     */
     fun enqueue(context: Context, text: String, preview: String) {
         val list = load(context).toMutableList()
-        list.add(Item(text, preview, System.currentTimeMillis()))
+        val now = System.currentTimeMillis()
+        if (list.any { it.text == text && now - it.ts < DEDUP_WINDOW_MS }) {
+            return
+        }
+        list.add(Item(UUID.randomUUID().toString(), text, preview, now))
+        while (list.size > MAX_ITEMS) list.removeAt(0)
         save(context, list)
     }
 
@@ -35,6 +54,7 @@ object PendingSmsQueue {
             val obj = arr.optJSONObject(i) ?: continue
             out.add(
                 Item(
+                    id = obj.optString("id", "").ifEmpty { UUID.randomUUID().toString() },
                     text = obj.optString("text", ""),
                     preview = obj.optString("preview", ""),
                     ts = obj.optLong("ts", 0L)
@@ -44,15 +64,18 @@ object PendingSmsQueue {
         return out
     }
 
-    fun clear(context: Context) {
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            .edit().putString(KEY, "[]").apply()
+    /** 确认送达后按 id 删除已发送条目 */
+    fun removeByIds(context: Context, ids: Set<String>) {
+        if (ids.isEmpty()) return
+        val list = load(context).filterNot { ids.contains(it.id) }
+        save(context, list)
     }
 
     private fun save(context: Context, list: List<Item>) {
         val arr = JSONArray()
         for (it in list) {
             val obj = org.json.JSONObject()
+            obj.put("id", it.id)
             obj.put("text", it.text)
             obj.put("preview", it.preview)
             obj.put("ts", it.ts)

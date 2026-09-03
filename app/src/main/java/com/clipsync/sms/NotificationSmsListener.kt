@@ -255,6 +255,11 @@ class NotificationSmsListener : NotificationListenerService() {
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
         val bigText = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString().orEmpty()
+        // tickerText 是系统为状态栏滚动预留的完整原文，MIUI/HyperOS 下它不做折叠，
+        // 形如「火山引擎: 【火山引擎】验证码： 520314 。您正在…」。
+        // 而 android.text/bigText 会把长短信开头签名折叠成「…】」，但验证码和正文完整。
+        // tickerText 是拿到完整短信最可靠的通知字段。
+        val ticker = sbn.notification.tickerText?.toString().orEmpty()
 
         // 过滤 MIUI/HyperOS 系统在"短信"通知渠道里发的运行状态提示，例如：
         //   title: "短信"
@@ -273,43 +278,84 @@ class NotificationSmsListener : NotificationListenerService() {
             return
         }
 
-        // 通知里的正文可能被系统折叠：EXTRA_BIG_TEXT 也不一定是全文，
-        // 优先从系统 SMS 数据库拉最近 60 秒内的原始短信（拿到即为准）；
-        // 拿不到再退回到通知的 bigText / text。
-        val notifBody = if (bigText.isNotBlank()) bigText else text
+        // tickerText 可能带「标题: 」前缀（如「火山引擎: 【火山引擎】验证码…」），剥掉它得到正文
+        val tickerBody = run {
+            var t = ticker.trim()
+            if (title.isNotBlank() && t.startsWith(title)) {
+                t = t.removePrefix(title).trimStart()
+                if (t.startsWith(":") || t.startsWith("：")) t = t.drop(1).trimStart()
+            }
+            t
+        }
+
+        // 采信优先级：数据库原文 > tickerText（完整全文）> bigText > text
+        val notifBody = when {
+            tickerBody.isNotBlank() -> tickerBody
+            bigText.isNotBlank() -> bigText
+            else -> text
+        }
         val (dbBody, dbFrom) = queryLatestSms()
 
-        // 采信优先级：数据库原文 > 通知 bigText > 通知 text
-        val body = when {
+        // 采信优先级：数据库原文 > 通知各字段
+        var body: String = when {
             !dbBody.isNullOrBlank() -> dbBody
             notifBody.isNotBlank() -> notifBody
             else -> return
         }
 
-        // 检测正文是否被系统"锁屏防偷窥"打码：内容里连续 5 个及以上 * 视为打码
-        val looksMasked = Regex("\\*{5,}").containsMatchIn(body)
-        if (looksMasked) {
-            Log.i(TAG, "⏸ 通知短信正文被系统打码（******），等待 SMS 广播的明文")
-            return
-        }
-
-        // 检测正文是否被系统"通知栏预览折叠"截断：
-        // MIUI/HyperOS 的通知栏对长短信会把开头切掉，只保留最后一段并在最前面加 "..." 或 "…"。
-        // 这种情况下 body 是残缺的，也让位给广播的明文版本。
-        val looksTruncated = body.trimStart().let { it.startsWith("...") || it.startsWith("…") }
-        if (looksTruncated) {
-            Log.i(TAG, "⏸ 通知短信被系统折叠（开头 …），等待 SMS 广播的明文")
-            return
-        }
-
         // 发件人：优先数据库里查到的（更真实），其次是通知标题（可能是联系人名）
-        val sender = when {
+        var sender: String = when {
             !dbFrom.isNullOrBlank() -> dbFrom
             title.isNotBlank() -> title
             else -> "未知"
         }
-        // 完整文本：如果发件人是号码/联系人，前面补【发件人】方便下游识别
-        val fullText = "【$sender】$body"
+
+        // 检测正文是否被系统"锁屏防偷窥"打码：内容里连续 5 个及以上 * 视为打码。
+        // 这种情况说明拿到的 body 是锁屏隐藏版，绝不能把 ****** 上行。
+        // 但注意：MIUI 上 SMS_RECEIVED 广播是被拦的（旧代码指望"等广播明文"永远等不到），
+        // 所以这里分两步：
+        //   1. 立刻再查一次数据库（短信此刻通常已写入 provider，之前查不到只是回调早于写入）；
+        //   2. 若数据库已有明文，用明文继续走落盘；若还没入库，直接 return——
+        //      数据库轮询（SmsDatabasePoller 每 20s）稍后入库时会读到完整原文兜底补发。
+        val looksMasked = Regex("\\*{5,}").containsMatchIn(body)
+        if (looksMasked) {
+            val (retryBody, retryFrom) = queryLatestSms()
+            if (!retryBody.isNullOrBlank() && !Regex("\\*{5,}").containsMatchIn(retryBody)) {
+                // 数据库里已有明文：直接用它，继续往下走落盘流程
+                Log.i(TAG, "🔓 通知正文打码，但数据库已查到明文，改用数据库原文")
+                body = retryBody
+                if (!retryFrom.isNullOrBlank()) sender = retryFrom
+            } else {
+                Log.i(TAG, "⏸ 通知正文打码且数据库暂未入库，等待数据库轮询兜底（20s 内）")
+                return
+            }
+        }
+
+        // 会话摘要通知：同一号码连发多条时，系统先推一条折叠摘要（形如
+        // 【阿里云】[2条]…验证码是：770395…），带 [N条] 计数且内容是几条的混合摘要。
+        // 几秒后会推不带计数的完整单条通知。摘要必须丢掉，否则残缺版先上行、
+        // 完整版再上行，Mac 上同一条验证码弹两次。
+        val isConversationSummary = Regex("\\[\\s*\\d+\\s*条\\s*\\]").containsMatchIn(body)
+        if (isConversationSummary) {
+            Log.i(TAG, "⏸ 跳过 [N条] 会话摘要，等待完整单条通知")
+            return
+        }
+
+        // 注意：长短信折叠时 android.text/bigText 开头会是「…】」（签名被截掉一段），
+        // 但验证码和正文在折叠处之后是完整的。绝不能因为开头的「…」就丢弃整条——
+        // tickerText 通常是完整全文，已优先采信；万一只有折叠版，也清洗开头残片后照发。
+        if (body.trimStart().startsWith("…") || body.trimStart().startsWith("...")) {
+            // 去掉折叠残片：把开头到第一个完整句子之前的残片清掉。
+            // 形如「…】验证码：520314。…此验证码。」→ 找到第一个「。」或正文起点重建
+            val cleaned = cleanFoldedHead(body)
+            if (cleaned.isNotBlank()) {
+                Log.i(TAG, "🧹 通知正文开头被折叠，已清洗残片后继续")
+                body = cleaned
+            }
+        }
+
+        // 完整文本：企业短信正文已带【签名】则直接用原文；个人短信才补【发件人】
+        val fullText = com.clipsync.sms.SmsDatabasePoller.composeSmsText(sender, body)
         val preview = "来自 $sender 的短信"
         if (!SmsDeduplicator.shouldUpload(sender, isPlaintext = false)) {
             Log.i(TAG, "⏸ 短信去重（通知）: $sender")
@@ -317,10 +363,23 @@ class NotificationSmsListener : NotificationListenerService() {
         }
         Log.i(TAG, "↑ 收到短信(通知): ${fullText.take(40)}")
 
+        // 统一走"先落盘、后补发"路径：通知监听里直接 ws.send() 时若连接是半开的
+        // （息屏 Doze 下被 NAT 静默掐断），消息写进本地缓冲区返回成功却石沉大海，
+        // 这条验证码就丢了。落盘后由 SyncService 补发、确认双向通畅后才删盘。
+        PendingSmsQueue.enqueue(this, fullText, preview)
+        com.clipsync.history.HistoryStore.addSms(
+            this,
+            com.clipsync.history.HistoryStore.HistoryItem(
+                id = java.util.UUID.randomUUID().toString(),
+                kind = "sms",
+                text = fullText,
+                preview = preview,
+                direction = "out",
+                ts = System.currentTimeMillis() / 1000
+            )
+        )
         val svc = Intent(this, SyncService::class.java).apply {
-            action = SyncService.ACTION_SEND_SMS_CODE
-            putExtra(SyncService.EXTRA_TEXT, fullText)
-            putExtra(SyncService.EXTRA_PREVIEW, preview)
+            action = SyncService.ACTION_FLUSH_PENDING_SMS
         }
         try {
             if (android.os.Build.VERSION.SDK_INT >= 26) {
@@ -329,7 +388,7 @@ class NotificationSmsListener : NotificationListenerService() {
                 startService(svc)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "✗ 短信转发失败: ${e.message}")
+            Log.e(TAG, "✗ 拉起 SyncService 失败: ${e.message}（短信已落盘，稍后自动补发）")
         }
     }
 
@@ -357,6 +416,28 @@ class NotificationSmsListener : NotificationListenerService() {
     private fun isSystemNotice(title: String, text: String, bigText: String): Boolean {
         val combined = listOf(title, text, bigText).joinToString(" ")
         return SYSTEM_NOTICE_KEYWORDS.any { combined.contains(it) }
+    }
+
+    /**
+     * 清洗折叠短信开头的残片。MIUI/HyperOS 对长短信的通知会把开头截成「…】」或「…」，
+     * 但后面验证码和正文完整。这里把开头到第一个实义内容之间的残片去掉：
+     *   「…】验证码： 520314 。您正在…」 → 「验证码： 520314 。您正在…」
+     * 规则：若开头是省略号，则裁掉开头直到出现「】」后的内容（残片只含被截签名），
+     * 或裁掉开头的省略号本身。
+     */
+    private fun cleanFoldedHead(raw: String): String {
+        var s = raw.trim()
+        if (!s.startsWith("…") && !s.startsWith("...")) return s
+        // 去掉开头省略号
+        s = s.removePrefix("…").removePrefix("...").trimStart()
+        // 若残片是被截的签名（以 】 结尾的前半段），且正文在 】 之后，裁到 】 之后
+        val bracketEnd = s.indexOf('】')
+        if (bracketEnd in 0..6) {
+            // 形如 】验证码：… —— 开头这个 】 是被截断签名的收尾，正文在其后
+            val after = s.substring(bracketEnd + 1).trimStart()
+            if (after.isNotBlank()) s = after
+        }
+        return s
     }
 
     /**

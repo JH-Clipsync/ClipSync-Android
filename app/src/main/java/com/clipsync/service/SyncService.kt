@@ -109,7 +109,12 @@ class SyncService : Service() {
          * 换 token，ws 是 null。若直接 send 会被吞掉，这条验证码就永远发不出去。
          * 先进队列，连接 OPEN 后统一补发。
          */
-        private val pendingSms = mutableListOf<Pair<String, String>>()
+        /**
+         * 已发送、等待"双向通畅"确认的短信（队列项 id → 发出时间）。
+         * 75s 后链路仍然通畅（能收到服务端帧）才把磁盘队列里对应条目删掉；
+         * 期间若检测到半开/断线，条目还在磁盘上，重连后用同一 id 补发。
+         */
+        private val inflightSms = LinkedHashMap<String, Long>()
 
         /**
          * 重启同步服务：登录 / 退出登录 / 改同步密码后调用，
@@ -173,6 +178,9 @@ class SyncService : Service() {
         com.clipsync.clipboard.ScreenshotWatcher.start(this)
         watchNetwork()
         connectWs()
+        // 短信投递确认 + 半开连接看门狗：定时发应用层 ping，
+        // 75s 收不到任何服务端帧就强制重连；发出满 75s 且链路通畅才删磁盘队列
+        startSmsWatchdog()
         // 通知监听兜底重绑：服务起来时本进程一定活着，此时调 requestRebind()
         // 系统最容易把 NotificationSmsListener 绑定上来。MIUI 杀进程后绑定会丢失，
         // 光靠用户回前台触发不可靠（且旧逻辑误判已连接会跳过），这里不依赖 UI。
@@ -528,29 +536,103 @@ class SyncService : Service() {
         }
     }
 
-    /** 连接就绪后补发暂存的短信（冷启动时收到的那批） */
+    /**
+     * 连接就绪后补发磁盘上的待发短信（冷启动 / 半开重连后都会调）。
+     *
+     * 短信在发送前已落盘（PendingSmsQueue），这里只负责把磁盘条目用**稳定 id**
+     * 发出去并记入 inflight；不立即删盘。75s 后链路仍双向通畅才确认删除，
+     * 这样半开连接下"发出去其实丢了"的短信重连后会自动补发，且 id 不变，
+     * PC 端按消息 id 去重，不会重复弹窗。
+     */
     private fun flushPendingSms() {
         val wsClient = ws ?: return
-        val toSend = synchronized(pendingSms) {
-            if (pendingSms.isEmpty()) return
-            val copy = pendingSms.toList()
-            pendingSms.clear()
-            copy
-        }
+        if (wsClient.state.value != WsClient.State.OPEN) return
+        val items = com.clipsync.sms.PendingSmsQueue.load(this)
+        if (items.isEmpty()) return
         var ok = 0
-        toSend.forEach { (text, preview) ->
-            // 发送失败不用塞回 pendingSms：WsClient.send 内部有离线队列，
-            // 下次连上它自己会重发，这里再存一份会重复
-            val sent = wsClient.send(
-                type = MessageType.NOTIFY_PC,
-                payloadText = text,
-                mime = "text/plain",
-                preview = preview,
-                kind = "sms_code"
-            )
-            if (sent) ok++
+        val now = System.currentTimeMillis()
+        synchronized(inflightSms) {
+            items.forEach { item ->
+                val sent = wsClient.send(
+                    type = MessageType.NOTIFY_PC,
+                    payloadText = item.text,
+                    mime = "text/plain",
+                    preview = item.preview,
+                    kind = "sms_code",
+                    id = item.id
+                )
+                if (sent) {
+                    ok++
+                    inflightSms[item.id] = now
+                }
+            }
         }
-        Log.i("ClipSync", "↑ 补发暂存短信 $ok/${toSend.size} 条")
+        Log.i("ClipSync", "↑ 待发短信已发出 $ok/${items.size} 条（等待 75s 通畅确认后清盘）")
+    }
+
+    /**
+     * 短信投递确认 + 半开连接看门狗。
+     *
+     * 每 20s 跑一次：
+     * 1. OPEN 时发一帧应用层 ping；收到服务端 pong 或任何数据帧即把未应答计数清零。
+     * 2. 连续 3 个 ping（≈60s）都收不到任何回应 → 判定为半开连接，主动断掉重建。
+     *    不用"墙钟 idle 时长"判定：息屏 Doze 时 CPU 被冻结，墙钟会把整个休眠
+     *    时长算进去造成误重连（表现为 Mac 反复弹"设备上线"）；而真实半开连接
+     *    在唤醒后发 ping 照样收不到 pong，计数判据能正确抓到、又不会误伤休眠。
+     * 3. 重连带 90s 最小间隔退避，避免抖动期反复触发服务端上下线广播。
+     * 4. 发出满 75s、且当前链路仍双向通畅的短信，从磁盘待发队列确认删除。
+     */
+    private fun startSmsWatchdog() {
+        serviceScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(20_000L)
+                if (destroyed) break
+                val wsClient = ws ?: continue
+                // 短信数据库轮询兜底：MIUI 上 SMS 广播被拦、短信通知不投递给第三方监听，
+                // 但 READ_SMS 能读到数据库。发现新短信先落盘，OPEN 时立即补发。
+                // 放在连接状态判断之前：断连期间也要落盘，重连后 flush 会一起发。
+                var newCount = 0
+                try {
+                    newCount = com.clipsync.sms.SmsDatabasePoller.pollNewSms(this@SyncService)
+                } catch (e: Exception) {
+                    Log.w("ClipSync", "短信轮询异常: ${e.message}")
+                }
+                if (newCount > 0) {
+                    Log.i("ClipSync", "🔁 轮询发现 $newCount 条新短信已落盘")
+                    if (wsClient.state.value == WsClient.State.OPEN) flushPendingSms()
+                }
+                if (wsClient.state.value != WsClient.State.OPEN) {
+                    synchronized(inflightSms) { inflightSms.clear() }
+                    continue
+                }
+                wsClient.sendAppPing()
+                // 连续未应答 ping 达阈值，且距上次强制重连已过退避窗口，才重连
+                if (wsClient.isLikelyHalfOpen(threshold = 3)) {
+                    val sinceLast = System.currentTimeMillis() - wsClient.lastForceReconnectAt
+                    if (wsClient.lastForceReconnectAt == 0L || sinceLast >= 90_000L) {
+                        Log.w("ClipSync", "🔍 看门狗：连续 ${wsClient.missedPings} 个 ping 无应答，疑似半开连接，强制重连")
+                        synchronized(inflightSms) { inflightSms.clear() }
+                        // 关掉这条半死不活的连接，WsClient 的重连循环立刻建新连；
+                        // 新连接 OPEN 后 flushPendingSms 会用同一 id 补发磁盘上的短信
+                        wsClient.forceReconnect()
+                    } else {
+                        Log.i("ClipSync", "🔍 看门狗：疑似半开但距上次重连仅 ${sinceLast / 1000}s，跳过（退避中）")
+                    }
+                    continue
+                }
+                // 确认投递：发出满 75s 且链路一直通（最近能收到帧/pong）
+                val deadline = System.currentTimeMillis() - 75_000L
+                val confirmed = synchronized(inflightSms) {
+                    val done = inflightSms.filterValues { it <= deadline }.keys
+                    inflightSms.keys.removeAll(done)
+                    done
+                }
+                if (confirmed.isNotEmpty()) {
+                    com.clipsync.sms.PendingSmsQueue.removeByIds(this@SyncService, confirmed)
+                    Log.i("ClipSync", "✅ ${confirmed.size} 条短信已确认送达并清盘")
+                }
+            }
+        }
     }
 
     /** 收到消息 → 自动写入本机剪贴板 + 存历史 */
@@ -712,77 +794,37 @@ class SyncService : Service() {
                 }
             }
             ACTION_FLUSH_PENDING_SMS -> {
-                // 持久化队列里的短信：冷启动时由 SmsReceiver 写入。
-                // 先全部挪到内存队列，清空持久化；再根据 ws 连接情况决定立即发 or 等连上后发。
-                // 这样"拉起服务失败→下次 App 打开"也能补发，不会永远留在磁盘里。
-                // 冷启动时换 token + 握手可能耗时十几秒，这段时间发生在 OPEN 之前、
-                // 拿不到 OPEN 后的 FlushSms 锁，Doze 下 CPU 睡着会让短信卡死在半路，
-                // 所以从入口就先持一把 30s 的锁覆盖整个建连过程。
+                // 短信在接收侧（SmsReceiver / 通知监听）已落盘，这里只管补发。
+                // 冷启动时换 token + 握手可能耗时十几秒，期间 Doze 下 CPU 可能睡着，
+                // 从入口先持一把 30s 的锁覆盖整个建连过程。
                 acquireBriefWakeLock("FlushSmsCold", 30_000L)
-                val items = com.clipsync.sms.PendingSmsQueue.load(this)
-                if (items.isNotEmpty()) {
-                    com.clipsync.sms.PendingSmsQueue.clear(this)
-                    synchronized(pendingSms) {
-                        pendingSms.addAll(items.map { it.text to it.preview })
-                    }
-                    Log.i("ClipSync", "📥 从持久化队列加载 ${items.size} 条待发短信")
-                }
                 val wsClient = ws
                 when {
                     wsClient == null -> {
-                        // ws 还没初始化：等 connectWs -> 连接 OPEN -> flushPendingSms 自动发
-                        Log.i("ClipSync", "📤 短信已入内存队列，等待连接就绪后补发")
-                        if (ws == null) connectWs()
+                        // ws 还没初始化：connectWs -> 连接 OPEN -> flushPendingSms 自动发
+                        Log.i("ClipSync", "📤 短信已在磁盘队列，等待连接就绪后补发")
+                        connectWs()
                     }
                     wsClient.state.value == WsClient.State.OPEN -> {
-                        // 已经连上，立刻发
+                        // 已经连上，立刻发（发完留在磁盘上，看门狗确认 75s 通畅后才清盘）
                         flushPendingSms()
                     }
                     else -> {
                         // 连接中/退避中：等 OPEN 后 flushPendingSms 自动触发
-                        Log.i("ClipSync", "📤 短信已入内存队列，连接中稍后补发")
+                        Log.i("ClipSync", "📤 短信已在磁盘队列，连接中稍后补发")
+                        wsClient.kick()
                     }
                 }
             }
             ACTION_SEND_SMS_CODE -> {
-                // 通知监听直传路径（MIUI/HyperOS 上短信广播常被拦截，主要走这条）。
-                // 息屏 Doze 下 onStartCommand 拿到 CPU 后随时可能再睡，发送/入队/写历史
-                // 都需要 CPU 在场；冷启动时还要覆盖换 token + 握手，故入口即持 30s 锁。
+                // 兼容旧入口（现在通知监听已直接落盘并发 FLUSH，这个分支理论上不再走）。
+                // 统一落盘后交给 FLUSH 流程，保证不丢。
                 acquireBriefWakeLock("SendSms", 30_000L)
                 val text = intent.getStringExtra(EXTRA_TEXT) ?: return START_STICKY
                 val preview = intent.getStringExtra(EXTRA_PREVIEW) ?: "短信验证码"
-                val wsClient = ws
-                if (wsClient == null) {
-                    // 冷启动：还在换 token，连接实例都没有。暂存，连上后补发，
-                    // 别让验证码消失在半路。（注意 ws 非空时不进来：WsClient.send
-                    // 内部已有离线队列，这里再存一份会导致补发两遍）
-                    synchronized(pendingSms) { pendingSms.add(text to preview) }
-                    Log.i("ClipSync", "↑ 上传短信: ${text.take(40)} → 连接未就绪，已暂存等待补发")
-                    // 主动拉起连接：服务若被系统冻结后靠通知监听解冻，ws 可能一直是 null，
-                    // 不触发 connectWs() 就只能干等下一次 OPEN，短信会长期卡住
-                    connectWs()
-                } else {
-                    val sent = wsClient.send(
-                        type = MessageType.NOTIFY_PC,
-                        payloadText = text,
-                        mime = "text/plain",
-                        preview = preview,
-                        kind = "sms_code"
-                    )
-                    Log.i("ClipSync", "↑ 上传短信: ${text.take(40)} → ${if (sent) "已立即发出" else "离线队列"}")
-                }
-                // 存短信历史（出）
-                HistoryStore.addSms(
-                    this,
-                    HistoryStore.HistoryItem(
-                        id = UUID.randomUUID().toString(),
-                        kind = "sms",
-                        text = text,
-                        preview = preview,
-                        direction = "out",
-                        ts = System.currentTimeMillis() / 1000
-                    )
-                )
+                com.clipsync.sms.PendingSmsQueue.enqueue(this, text, preview)
+                if (ws == null) connectWs() else flushPendingSms()
+                Log.i("ClipSync", "↑ 上传短信: ${text.take(40)} → 已落盘补发")
             }
             ACTION_SEND_SHARE -> {
                 val text = intent.getStringExtra(EXTRA_TEXT)

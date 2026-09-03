@@ -62,6 +62,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var clipTypeTag: TextView
     private lateinit var clipFootnote: TextView
     private lateinit var pushBtn: Button
+    // 当前预览的图片地址：非 null 时点击预览区打开全屏查看器
+    private var previewImageUri: android.net.Uri? = null
 
     // 在线设备
     private lateinit var onlineCard: LinearLayout
@@ -566,6 +568,17 @@ class MainActivity : AppCompatActivity() {
 
         statusHint = Design.text(this, " ", Design.Text.CAPTION, Design.Color.INK_MUTED).apply {
             gravity = Gravity.CENTER
+            // 让"服务器地址 / 错误原因"行可长按复制。
+            // Android TextView 默认 isTextSelectable=false（既不能拖选也不能长按弹菜单），
+            // 打开后用户长按会看到「复制」气泡，菜单和系统复制一致。
+            // setTextIsSelectable 要求 TextView 不能是 wrap_content+ellipsize 同时开启，
+            // 这里给个 false 避免和后续 isSingleLine 冲突。
+            setTextIsSelectable(true)
+            // 浮窗（PopupWindow / 系统选择菜单）默认能用，单独声明是为了不依赖系统默认值
+            setSelectAllOnFocus(false)
+            isLongClickable = true
+            isFocusable = true
+            isFocusableInTouchMode = false
         }
         card.addView(statusHint, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1148,6 +1161,13 @@ class MainActivity : AppCompatActivity() {
                 Design.Radius.INPUT
             )
             clipToOutline = true
+            isClickable = true
+            isFocusable = true
+            // 图片态：点击打开全屏查看器；文本/空态 previewImageUri 为 null，不响应
+            setOnClickListener {
+                val uri = previewImageUri ?: return@setOnClickListener
+                com.clipsync.ui.ImageViewerActivity.open(this@MainActivity, uri)
+            }
         }
         clipPreviewText = Design.text(this, "", Design.Text.CAPTION, Design.Color.INK_SECONDARY).apply {
             setLineSpacing(0f, 1.7f)
@@ -1323,9 +1343,10 @@ class MainActivity : AppCompatActivity() {
         if (clipImage != null) {
             val bmp = ClipboardManagerHelper.decodeImageUri(clipImage)
             if (bmp != null) {
+                previewImageUri = clipImage
                 showImagePreview(
                     bmp, "图片",
-                    "${bmp.width} × ${bmp.height} · 点「推送到电脑」发送原图"
+                    "${bmp.width} × ${bmp.height} · 点击查看大图 · 点「推送到电脑」发送原图"
                 )
                 return
             }
@@ -1358,6 +1379,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 文本态：显示文字、隐藏图片，并同步标签与脚注 */
     private fun showTextPreview(body: CharSequence, tag: String, footnote: String) {
+        previewImageUri = null
         clipPreviewImage.visibility = View.GONE
         clipPreviewImage.setImageDrawable(null)
         // 复位高度：从图片态切回来时若不复位，文字下面会留一大块空白
@@ -1436,6 +1458,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 空态：主按钮置灰，避免用户点了才知道没内容 */
     private fun showEmptyPreview() {
+        previewImageUri = null
         clipPreviewImage.visibility = View.GONE
         clipPreviewImage.setImageDrawable(null)
         setPreviewHeight(Design.dp(this, Design.CLIP_PREVIEW_HEIGHT))
@@ -1461,8 +1484,9 @@ class MainActivity : AppCompatActivity() {
     private fun showScreenshot(shot: android.net.Uri) {
         val bmp = ClipboardManagerHelper.decodeImageUri(shot)
         if (bmp != null) {
+            previewImageUri = shot
             val size = "${bmp.width} × ${bmp.height}"
-            showImagePreview(bmp, "新截图", "$size · 点「推送到电脑」发送原图")
+            showImagePreview(bmp, "新截图", "$size · 点击查看大图 · 点「推送到电脑」发送原图")
             // 截图标签用主色调，和普通图片区分开
             clipTypeTag.setTextColor(Design.Color.PRIMARY_PRESSED)
             (clipTypeTag.background as? GradientDrawable)?.setColor(Design.Color.PRIMARY_TINT)

@@ -11,7 +11,9 @@ val localProps = Properties().apply {
     val f = rootProject.file("local.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }
-val defaultServer = localProps.getProperty("clipsync.server", "ws://127.0.0.1:8080")
+// 默认指向公共服务端；本地调试时在 local.properties 覆盖 clipsync.server=ws://host:port
+// 注意：服务端走 /clipsync 路径反代（仅 HTTP），WebSocket 只连主机；这里只写主机地址
+val defaultServer = localProps.getProperty("clipsync.server", "wss://www.95qw.com")
 // token 不再由构建期注入：改为登录接口签发。这里只保留一个默认用户名方便本地联调。
 val defaultUsername = localProps.getProperty("clipsync.username", "")
 
@@ -23,8 +25,8 @@ android {
         applicationId = "com.clipsync"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "2026.8.26.1"
+        versionCode = 8
+        versionName = "2026.9.3.1"
 
         // 把默认配置作为 BuildConfig 常量注入到代码里
         buildConfigField("String", "DEFAULT_SERVER", "\"$defaultServer\"")

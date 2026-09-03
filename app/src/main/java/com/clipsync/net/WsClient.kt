@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.jsonObject
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -77,6 +79,42 @@ class WsClient(
 
     enum class State { CONNECTING, OPEN, CLOSED }
 
+    /**
+     * 最近一次收到服务端任何数据帧（presence/业务消息/pong）的时间。
+     */
+    @Volatile
+    var lastInboundAt: Long = System.currentTimeMillis()
+        private set
+
+    /**
+     * 是否收到过服务端对应用层 ping 的 pong 应答。
+     * 只有收到过，才说明服务端版本支持半开检测，看门狗才启用，
+     * 避免旧服务端不应答时被误判为断连。
+     */
+    @Volatile
+    var pongSeen: Boolean = false
+        private set
+
+    /**
+     * 已发出但尚未收到 pong 的应用层 ping 序号（单调递增）。
+     * 看门狗每个 tick 发一个 ping 并记录序号；收到 pong 时清零。
+     * 用"发出后跨过一个确认窗口仍无 pong"判死亡，而不是看墙钟 idle 时长——
+     * 因为息屏 Doze 时 CPU 冻结，墙钟会把整个休眠时长算进去造成误判，
+     * 而真实半开连接在唤醒后发 ping 也照样收不到 pong。
+     */
+    @Volatile
+    private var pendingPingSeq: Int = 0
+
+    /** 连续多少个 ping 发出后没收到任何 pong/数据帧（收到任意入站帧即清零） */
+    @Volatile
+    var missedPings: Int = 0
+        private set
+
+    /** 最近一次强制重连时间，用于重连退避，避免抖动期反复上下线广播 */
+    @Volatile
+    var lastForceReconnectAt: Long = 0L
+        private set
+
     private val client = OkHttpClient.Builder()
         .pingInterval(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS) // 长连接
@@ -116,6 +154,19 @@ class WsClient(
 
     fun kick() {
         kickRequested = true
+    }
+
+    /**
+     * 强制结束当前这一条连接，但保留重连循环（区别于 [stop] 的彻底停止）。
+     * 看门狗发现半开连接（看似 OPEN 实际收发都不通）时调用：
+     * 关掉底层 socket → connectOnce 的 await 返回 → loop 立即建新连（kick 跳过退避）。
+     * 不重置 running，新连接 OPEN 后离线队列/上层磁盘队列会自动补发。
+     */
+    fun forceReconnect() {
+        kickRequested = true
+        lastForceReconnectAt = System.currentTimeMillis()
+        runCatching { ws?.close(1001, "reconnect") }
+        ws = null
     }
 
     private suspend fun loop() {
@@ -167,6 +218,23 @@ class WsClient(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                // 收到任何数据帧都说明双向链路是通的（半开检测的活跃证据）
+                lastInboundAt = System.currentTimeMillis()
+                // 任意入站帧都意味着之前发出的 ping 已有回应，清零未应答计数
+                pendingPingSeq = 0
+                missedPings = 0
+                // pong 是服务端对我们应用层 ping 的应答，只刷新活跃时间，不进业务流。
+                // 旧服务端不应答 ping，pongSeen 永远为 false，看门狗自动不启用。
+                val firstType = runCatching {
+                    json.parseToJsonElement(text).jsonObject["type"]?.let {
+                        json.decodeFromJsonElement<String>(it)
+                    }
+                }.getOrNull()
+                if (firstType == "pong") {
+                    if (!pongSeen) Log.i("ClipSync", "🫓 收到服务端 pong，半开连接看门狗已武装")
+                    pongSeen = true
+                    return
+                }
                 runCatching {
                     // presence 消息的 payload 是 {"devices":[...]}，跟业务消息结构不同，
                     // 先单独解析并更新在线设备列表，不进业务消息流
@@ -213,6 +281,39 @@ class WsClient(
      * @param type 走 MessageType 里的常量：NOTIFY_PC / NOTIFY_MOBILE / NOTIFY_ALL / CLIPBOARD
      * @param kind 业务子类型，比如 "sms_code" / "text" / "image" / "share"
      */
+    /**
+     * 发应用层心跳。服务端收到后单播回一帧 pong，刷新 [lastInboundAt]，
+     * 作为"上行+下行都通"的探测信号。
+     */
+    /**
+     * 发应用层心跳。服务端收到后单播回一帧 pong，收到任意入站帧即清零未应答计数。
+     * 每次调用递增一个"已发出未回应"的 ping 计数。
+     */
+    fun sendAppPing() {
+        if (_state.value != State.OPEN) return
+        val ok = runCatching { ws?.send("""{"type":"ping"}""") }.getOrDefault(false)
+        if (ok == true) {
+            pendingPingSeq += 1
+            missedPings += 1
+        }
+    }
+
+    /**
+     * 看门狗判定：当前是否疑似半开连接（需要强制重连）。
+     *
+     * 判据不是墙钟 idle 时长（息屏 Doze 时 CPU 冻结会把休眠时长误算进去），
+     * 而是"已连续发出 [threshold] 个应用层 ping 却没收到任何 pong/数据帧"——
+     * 真实半开连接在唤醒后发 ping 也收不到 pong；而 Doze 冻结恢复后，
+     * 积压的 pong/presence 帧一到达就会把计数清零，不会误判。
+     *
+     * 只有服务端支持 pong（[pongSeen]）才启用，旧服务端恒返回 false。
+     */
+    fun isLikelyHalfOpen(threshold: Int = 3): Boolean {
+        if (!pongSeen) return false
+        if (_state.value != State.OPEN) return false
+        return missedPings >= threshold
+    }
+
     /** @return true = 立即发出；false = 未连接，已进离线队列，连接恢复后自动发 */
     fun send(
         type: String,
@@ -221,7 +322,8 @@ class WsClient(
         mime: String? = null,
         preview: String? = null,
         kind: String? = null,
-        to: String = "*"
+        to: String = "*",
+        id: String = UUID.randomUUID().toString()
     ): Boolean {
         val plainPayload = MessagePayload(
             text = payloadText,
@@ -237,7 +339,7 @@ class WsClient(
             plainPayload
         }
         val msg = Message(
-            id = UUID.randomUUID().toString(),
+            id = id,
             type = type,
             from = deviceID,
             to = to,

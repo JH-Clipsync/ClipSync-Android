@@ -17,6 +17,15 @@ Core scenario: **When you receive a verification code or copy something on your 
 
 It doesn't depend on any third-party push service (FCM / Xiaomi / Huawei pushes are not used); all traffic goes through your own WebSocket relay, with optional end-to-end encryption, so privacy stays under your control.
 
+## 🌐 Public Server (Pre-configured)
+
+The default `serverURL` in this client is **`wss://www.95qw.com`**. After installation, **no setup is required** — just register an account and you're in.
+
+- **Self-hosted instance?** Open *Settings → Server URL* and change it to `wss://your-domain` (no path; the reverse proxy handles the path).
+- **Fully offline / LAN?** The server is a single Go binary / Docker container. See the [ClipSync-Server deployment guide](https://github.com/JH-Clipsync/ClipSync-Server#-reverse-proxy--path-planning).
+- **Local dev override:** add `clipsync.server=ws://your-LAN-IP:8080` to `local.properties` and rebuild.
+
+
 > Minimum system: **Android 7.0 (API 24)** · targetSdk: **35** · Language: **Kotlin 2.0** · Build: **Gradle 8.9 + AGP 8.7**
 
 ---
@@ -37,6 +46,7 @@ It doesn't depend on any third-party push service (FCM / Xiaomi / Huawei pushes 
 | 🇨🇳 **Domestic-ROM keep-alive adaptation** | Special detection and guidance for MIUI/HyperOS "notification-category SMS", "background pop-ups", "unrestricted battery", and "notification-access truly connected". |
 | 🔄 **Automatic reconnect** | Automatically reconnects on network jitter / Token failure with exponential backoff; service restarts automatically when connection parameters change. |
 | 📜 **Message history** | SMS and clipboard are persisted separately, each keeping the latest 200 entries, with view, copy, delete, and clear-all support. |
+| 📖 **Copyable address / error text** | **Long-press the server address on the status card to copy it** (system copy menu). All connection-failure, code-recognition and permission prompts are also selectable, so you can paste them straight into issues / tickets. |
 | 🖼️ **Image compression** | Shared / clipboard images are automatically compressed to JPEG, longest side 1600px, quality 80%, so even large images won't stall the app. |
 | ⚙️ **Settings page** | Server address, account, end-to-end encryption, clipboard toggles, permission guidance, history, and version info. |
 
