@@ -55,6 +55,10 @@ class SyncService : Service() {
         private const val CHANNEL_ALERTS_ID = "clipsync_alerts"
         private const val NOTIFICATION_ID = 1
         private const val PRESENCE_NOTIF_BASE = 2000
+        /** 权限缺失提醒通知（独立于常驻通知，可被用户划掉） */
+        private const val PERM_NOTIF_ID = 3000
+        /** 权限提醒最小间隔，避免看门狗每 20s 骚扰一次 */
+        private const val PERM_ALERT_INTERVAL_MS = 6 * 60 * 60 * 1000L // 6 小时
 
         @Volatile
         private var currentWs: WsClient? = null
@@ -136,6 +140,13 @@ class SyncService : Service() {
     private var incomingJob: Job? = null
     private var stateJob: Job? = null
     private var authJob: Job? = null
+
+    /** 上次弹权限缺失提醒的时间，用于节流（见 PERM_ALERT_INTERVAL_MS） */
+    private var lastPermAlertAt = 0L
+    /** 当前检测到的权限问题数，避免无变化时反复重建常驻通知 */
+    private var lastPermIssueCount = -1
+    /** 当前权限告警摘要（拼进常驻通知文案），null 表示无未决问题 */
+    private var permWarningText: String? = null
 
     /** 网络恢复监听：没网时连接失败后，联网瞬间自动重试，不必用户手动点 */
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
@@ -584,6 +595,116 @@ class SyncService : Service() {
     }
 
     /**
+     * 短信链路权限/组件守卫，由看门狗每 20s 调一次。
+     *
+     *  - 通知监听掉绑但总开关还在：自动 requestRebind（幂等）；
+     *  - 发现需要用户手动处理的权限（MIUI 通知类短信/后台弹窗、NLS 总开关、电池白名单）：
+     *      1) 常驻通知文案追加告警，用户任何时候拉下通知栏都能看到；
+     *      2) App 在后台且满足节流条件时，再弹一条可点击通知，直达对应系统设置页；
+     *  - 问题全部消失：清除告警状态，立刻通知一次（让常驻通知文案恢复正常）。
+     */
+    private fun runPermissionGuard() {
+        val issues = try {
+            com.clipsync.ui.PermissionStatus.smsIssues(this)
+        } catch (e: Exception) {
+            Log.w("ClipSync", "权限守卫检测异常: ${e.message}")
+            return
+        }
+
+        // 掉绑自动修复（开关在、服务没连）
+        if (issues.any { it.key == com.clipsync.ui.PermissionStatus.KEY_NLS_REBIND }) {
+            try {
+                com.clipsync.sms.NotificationSmsListener.ensureConnected(this)
+            } catch (_: Exception) { /* 下轮再试 */ }
+        }
+
+        // 运行时权限缺失在后台无法弹系统授权框，交给首页守卫条；这里只统计手动项
+        val manual = issues.filter {
+            it.fix == com.clipsync.ui.PermissionStatus.Fix.MANUAL
+        }
+
+        val signature = manual.joinToString(",") { it.key }
+        val warning = if (manual.isEmpty()) null
+        else "短信同步权限缺失（${manual.joinToString("、") { it.label }}），点击处理"
+
+        // 状态变化时刷新常驻通知
+        if (warning != permWarningText || issues.size != lastPermIssueCount) {
+            permWarningText = warning
+            lastPermIssueCount = issues.size
+            refreshForegroundNotification()
+        }
+
+        if (manual.isEmpty()) {
+            // 恢复正常：撤掉残留的权限提醒通知，并重置节流
+            getSystemService(NotificationManager::class.java)?.cancel(PERM_NOTIF_ID)
+            lastPermAlertAt = 0L
+            lastAlertedSignature = null
+            return
+        }
+
+        // App 在前台：首页守卫条已在提示，不弹通知骚扰
+        if (com.clipsync.state.AppForeground.isForeground) return
+
+        val now = System.currentTimeMillis()
+        val newIssueAppeared = signature != lastAlertedSignature
+        val throttlePassed = now - lastPermAlertAt >= PERM_ALERT_INTERVAL_MS
+        if (!newIssueAppeared && !throttlePassed) return
+        lastPermAlertAt = now
+        lastAlertedSignature = signature
+        postPermissionAlert(manual)
+    }
+
+    private var lastAlertedSignature: String? = null
+
+    /** 弹一条可点击的权限提醒通知，点击直达首要问题的系统设置页 */
+    private fun postPermissionAlert(
+        manual: List<com.clipsync.ui.PermissionStatus.SmsIssue>
+    ) {
+        val nm = getSystemService(NotificationManager::class.java) ?: return
+        ensureAlertsChannel()
+        val top = manual.first()
+
+        // 优先直达具体设置页；拿不到 intent 就退到打开 App 首页（守卫条承接）
+        val direct = com.clipsync.ui.PermissionStatus.manualFixIntent(this, top.key)
+            ?.apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+        val clickIntent = direct ?: Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+        val pi = PendingIntent.getActivity(this, PERM_NOTIF_ID, clickIntent, piFlags)
+
+        val more = if (manual.size > 1) "等 ${manual.size} 项" else ""
+        val notif = NotificationCompat.Builder(this, CHANNEL_ALERTS_ID)
+            .setContentTitle("ClipSync 短信同步可能失效")
+            .setContentText("请开启「${top.label}」$more，否则验证码无法同步到电脑")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText(manual.joinToString("\n") { "· ${it.label}：${it.why}" })
+            )
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .build()
+        nm.notify(PERM_NOTIF_ID, notif)
+    }
+
+    /** 用当前连接状态 + 权限告警摘要重建常驻通知 */
+    private fun refreshForegroundNotification() {
+        val state = ws?.let { w ->
+            when (w.state.value) {
+                WsClient.State.OPEN -> ConnectionBus.STATE_OPEN
+                WsClient.State.CONNECTING -> ConnectionBus.STATE_CONNECTING
+                else -> ConnectionBus.STATE_CLOSED
+            }
+        } ?: ConnectionBus.STATE_CLOSED
+        getSystemService(NotificationManager::class.java)
+            ?.notify(NOTIFICATION_ID, buildNotification(state))
+    }
+
+    /**
      * 短信投递确认 + 半开连接看门狗。
      *
      * 每 20s 跑一次：
@@ -600,6 +721,8 @@ class SyncService : Service() {
             while (true) {
                 kotlinx.coroutines.delay(20_000L)
                 if (destroyed) break
+                // 短信链路权限/组件守卫：与连接状态无关，连接中也要监测
+                runPermissionGuard()
                 val wsClient = ws ?: continue
                 // 短信数据库轮询兜底：MIUI 上 SMS 广播被拦、短信通知不投递给第三方监听，
                 // 但 READ_SMS 能读到数据库。发现新短信先落盘，OPEN 时立即补发。
@@ -987,9 +1110,11 @@ class SyncService : Service() {
             else -> "未连接"
         }
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val contentText = permWarningText ?: "点击打开应用"
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("ClipSync · $stateText")
-            .setContentText("点击打开应用")
+            .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_menu_share)
             .setContentIntent(contentIntent)
             .setOngoing(true)
@@ -998,6 +1123,10 @@ class SyncService : Service() {
             .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setShowWhen(false)
-            .build()
+        // 权限告警文案较长时展开常驻通知
+        if (permWarningText != null) {
+            builder.setStyle(NotificationCompat.BigTextStyle().bigText(contentText))
+        }
+        return builder.build()
     }
 }

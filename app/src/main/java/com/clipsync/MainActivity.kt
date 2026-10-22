@@ -100,6 +100,14 @@ class MainActivity : AppCompatActivity() {
         refreshClipPreview()
     }
 
+    /** 守卫触发的短信/通知运行时权限请求，回来后重扫守卫 */
+    private val smsPermLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        android.util.Log.i("ClipSync", "短信权限授权结果: $it")
+        refreshSmsGuard()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ThemeManager.init(this)
@@ -280,10 +288,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        com.clipsync.state.AppForeground.isForeground = true
         ConnectionBus.addListener(stateListener)
         com.clipsync.state.PresenceBus.addListener(presenceListener)
         renderTarget()
-        refreshNotifListenerWarning()
+        refreshSmsGuard()
         com.clipsync.clipboard.ClipboardManagerHelper.onForeground()
         // 锁屏时间长了系统可能把进程杀掉。这里做两件事：
         // 1) 如果用户曾开启同步但服务死了，直接拉起来（配合 JobScheduler 兜底保活）
@@ -369,6 +378,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        com.clipsync.state.AppForeground.isForeground = false
         ClipboardManagerHelper.removePreviewListener(previewListener)
         // 注意：不在 onPause 里 removeListener。
         // startForegroundService 在 MIUI 上可能触发短暂的 onPause → onResume，
@@ -412,7 +422,7 @@ class MainActivity : AppCompatActivity() {
                 Design.dp(this@MainActivity, 12f), Design.dp(this@MainActivity, 10f))
             isClickable = true
             visibility = View.GONE
-            setOnClickListener { openNotificationListenerSettings() }
+            setOnClickListener { onGuardPrimaryAction() }
             val dot = View(this@MainActivity).apply {
                 background = Design.circleBg(0xFFFF9800.toInt())
             }
@@ -440,7 +450,7 @@ class MainActivity : AppCompatActivity() {
                 setPadding(h, v, h, v)
                 isClickable = true
                 isFocusable = true
-                setOnClickListener { openNotificationListenerSettings() }
+                setOnClickListener { onGuardPrimaryAction() }
             }
             addView(notifListenerWarningBtn, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -459,59 +469,114 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun refreshNotifListenerWarning() {
+    /**
+     * 短信同步守卫：每次回前台全量扫描短信链路所需权限/组件。
+     *
+     * 处理策略：
+     *  - 能自动修的（通知监听掉绑但开关还在）静默触发重绑；
+     *  - 需要一次交互的运行时权限，收敛到守卫条按钮点击弹系统框；
+     *  - 必须去系统设置的（MIUI 通知类短信/后台弹窗、NLS 总开关、电池白名单）
+     *    显示警告条 + 一键跳转，不遗漏任何一项。
+     */
+    private fun refreshSmsGuard() {
         if (!::notifListenerWarning.isInitialized) return
-
-        val listener = com.clipsync.sms.NotificationSmsListener
-        val permissionEnabled = com.clipsync.ui.PermissionStatus.notificationListenerEnabled(this)
-        val listenerLive = com.clipsync.ui.PermissionStatus.notificationListenerLive(this)
-        val recentlyActive = System.currentTimeMillis() - listener.lastNotifyAt < 60_000L
-        val wasConnected = listener.wasEverConnected(this)
-
-        android.util.Log.i(
-            "ClipSync",
-            "刷新通知监听状态: isConnected=${listener.isConnected}, " +
-                "permissionEnabled=$permissionEnabled, listenerLive=$listenerLive, " +
-                "recentlyActive=$recentlyActive, wasConnected=$wasConnected"
-        )
-
-        // 是否真正绑定：以 NotificationListenerService 的实时回调状态为准
-        // （isConnected 由 onListenerConnected/Disconnected 维护，最可靠）。
-        // listenerLive 走隐藏 API 反射，MIUI 上拿不到真实状态，只作辅助；
-        // recentlyActive 表示最近 60s 真的收到过通知。
-        // 三者有一为真才认为监听可用——避免"权限在但服务没绑定"时误判正常、
-        // 从而跳过 requestRebind，导致通知监听永远恢复不了。
-        val actuallyConnected = listener.isConnected || listenerLive || recentlyActive
-        if (actuallyConnected) {
+        // 用户还没开启过同步，不拿权限问题打扰首启体验
+        if (!SyncService.isUserEnabled(this)) {
             notifListenerWarning.visibility = View.GONE
-            // 即便 UI 不告警，只要静态状态是未连接就补一次重绑，幂等无副作用
-            if (!listener.isConnected && permissionEnabled) {
-                listener.ensureConnected(this)
-            }
             return
         }
 
-        if (permissionEnabled) {
-            // 设置里开关还在，只是服务没被绑定（MIUI 杀进程后绑定丢失 / 未重绑）。
-            // 这里必须真正触发 requestRebind：旧逻辑因 listenerLive 误判为 true 而
-            // 提前 return，ensureConnected 从来没被调用，监听一直恢复不了。
-            notifListenerWarningText.text = "通知监听服务未绑定，正在尝试自动恢复…"
-            notifListenerWarningBtn.text = "去设置"
-            notifListenerWarning.visibility = View.VISIBLE
-            listener.ensureConnected(this)
+        val issues = com.clipsync.ui.PermissionStatus.smsIssues(this)
+        if (issues.isEmpty()) {
+            notifListenerWarning.visibility = View.GONE
+            return
+        }
+
+        // 掉绑类：开关在、服务没连——静默自动重绑（幂等），并安排复查
+        issues.firstOrNull { it.fix == com.clipsync.ui.PermissionStatus.Fix.REBIND_LISTENER }?.let {
+            com.clipsync.sms.NotificationSmsListener.ensureConnected(this)
             scheduleNotifListenerChecks()
+        }
+
+        // 警告条只呈现"需要用户动手"的项；若只剩自动重绑在途，显示恢复中
+        val manual = issues.filter { it.fix == com.clipsync.ui.PermissionStatus.Fix.MANUAL }
+        val runtime = issues.filter { it.fix == com.clipsync.ui.PermissionStatus.Fix.RUNTIME_PERM }
+
+        val primary = manual.firstOrNull() ?: runtime.firstOrNull()
+        ?: issues.firstOrNull { it.fix == com.clipsync.ui.PermissionStatus.Fix.REBIND_LISTENER }
+
+        if (primary == null) {
+            notifListenerWarning.visibility = View.GONE
             return
         }
 
-        // 设置里开关也没了：区分"曾经被收回"和"从来没开过"
-        if (wasConnected) {
-            notifListenerWarningText.text = "系统已关闭通知监听权限，短信同步可能失效，点击重新开启"
-            notifListenerWarningBtn.text = "重新开启"
-        } else {
-            notifListenerWarningText.text = "需要开启通知监听权限，才能同步短信通知"
-            notifListenerWarningBtn.text = "去开启"
+        val pendingCount = issues.count {
+            it.fix != com.clipsync.ui.PermissionStatus.Fix.REBIND_LISTENER
+        }
+        notifListenerWarningText.text = when (primary.fix) {
+            com.clipsync.ui.PermissionStatus.Fix.REBIND_LISTENER ->
+                "通知监听服务未绑定，正在自动恢复…"
+            else -> if (pendingCount > 1) "${pendingCount} 项权限待开启：${primary.label}（${primary.why}）"
+            else "${primary.label}未开启：${primary.why}"
+        }
+        notifListenerWarningBtn.text = when (primary.fix) {
+            com.clipsync.ui.PermissionStatus.Fix.RUNTIME_PERM -> "授权"
+            com.clipsync.ui.PermissionStatus.Fix.REBIND_LISTENER -> "去设置"
+            com.clipsync.ui.PermissionStatus.Fix.MANUAL -> "去开启"
         }
         notifListenerWarning.visibility = View.VISIBLE
+    }
+
+    /** 守卫条 / 按钮点击：按当前首要问题执行对应修复 */
+    private fun onGuardPrimaryAction() {
+        if (!SyncService.isUserEnabled(this)) return
+        val issues = com.clipsync.ui.PermissionStatus.smsIssues(this)
+
+        // 1) 运行时权限：直接弹系统授权框
+        val runtimeIssue = issues.firstOrNull {
+            it.fix == com.clipsync.ui.PermissionStatus.Fix.RUNTIME_PERM
+        }
+        if (runtimeIssue != null) {
+            val missing = com.clipsync.ui.PermissionStatus.missingSmsRuntimePermissions(this)
+            if (missing.isNotEmpty()) {
+                try {
+                    smsPermLauncher.launch(missing)
+                } catch (_: Exception) {
+                    // 标准弹窗被 ROM 拦截：退到应用详情页手动开
+                    try {
+                        startActivity(
+                            android.content.Intent(
+                                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS
+                            ).setData(android.net.Uri.parse("package:$packageName"))
+                        )
+                    } catch (_: Exception) {}
+                }
+                return
+            }
+        }
+
+        // 2) 掉绑：先尝试自动重绑
+        issues.firstOrNull { it.fix == com.clipsync.ui.PermissionStatus.Fix.REBIND_LISTENER }?.let {
+            com.clipsync.sms.NotificationSmsListener.ensureConnected(this)
+            scheduleNotifListenerChecks()
+        }
+
+        // 3) 必须手动：跳第一个未决项对应的系统设置页
+        val manual = issues.firstOrNull { it.fix == com.clipsync.ui.PermissionStatus.Fix.MANUAL }
+            ?: return
+        val intent = com.clipsync.ui.PermissionStatus.manualFixIntent(this, manual.key)
+        if (intent != null) {
+            try {
+                startActivity(intent)
+                if (manual.key == com.clipsync.ui.PermissionStatus.KEY_MIUI_NOTIF_SMS ||
+                    manual.key == com.clipsync.ui.PermissionStatus.KEY_MIUI_POPUP
+                ) {
+                    toast.show("在权限页找到「通知类短信」「后台弹窗」并开启", 0xFFE65100.toInt())
+                }
+            } catch (_: Exception) {
+                toast.show("请手动到系统设置中开启${manual.label}", 0xFFE65100.toInt())
+            }
+        }
     }
 
     /** 多次检查通知监听是否恢复，系统绑定通常需要 1~3 秒 */
@@ -529,9 +594,17 @@ class MainActivity : AppCompatActivity() {
                 val live = com.clipsync.ui.PermissionStatus.notificationListenerLive(this)
                 val recentlyActive = System.currentTimeMillis() - listener.lastNotifyAt < 60_000L
                 if (listener.isConnected || live || recentlyActive) {
-                    notifListenerWarning.visibility = View.GONE
+                    // 监听恢复后重扫整个守卫，避免只隐藏本条而漏掉其它待办权限
+                    refreshSmsGuard()
                 } else if (delay == 10_000L) {
-                    notifListenerWarningText.text = "通知监听仍未恢复，请点击右侧按钮去设置关闭再打开"
+                    // 自动重绑失败：重扫，由守卫条给出可点击的手动设置入口
+                    refreshSmsGuard()
+                    val still = com.clipsync.ui.PermissionStatus.smsIssues(this)
+                        .any { it.key == com.clipsync.ui.PermissionStatus.KEY_NLS_REBIND ||
+                            it.key == com.clipsync.ui.PermissionStatus.KEY_NLS_SWITCH }
+                    if (still && ::notifListenerWarningText.isInitialized) {
+                        notifListenerWarningText.text = "通知监听仍未恢复，请点右侧按钮去设置关闭再打开"
+                    }
                 }
             }, delay)
         }

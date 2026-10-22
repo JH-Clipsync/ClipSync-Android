@@ -4,7 +4,9 @@ import android.app.AppOpsManager
 import android.Manifest
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
@@ -47,6 +49,25 @@ object PermissionStatus {
 
     fun hasRuntimePermissions(ctx: Context): Boolean =
         missingRuntimePermissions(ctx).isEmpty()
+
+    /**
+     * 仅短信链路必需的运行时权限：收/读短信，以及 Android 13+ 的通知权限。
+     * 刻意不含图片/存储权限——那是剪贴板图片功能用的，缺它不该触发短信守卫告警。
+     */
+    private val SMS_RUNTIME_PERMS by lazy {
+        buildList {
+            add(Manifest.permission.RECEIVE_SMS)
+            add(Manifest.permission.READ_SMS)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }.toTypedArray()
+    }
+
+    fun missingSmsRuntimePermissions(ctx: Context): Array<String> =
+        SMS_RUNTIME_PERMS.filter {
+            ContextCompat.checkSelfPermission(ctx, it) != PackageManager.PERMISSION_GRANTED
+        }.toTypedArray()
 
     fun batteryUnrestricted(ctx: Context): Boolean {
         val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -134,50 +155,53 @@ object PermissionStatus {
      * 对应 Android hide op OP_BACKGROUND_START_ACTIVITY (code=10011)。
      * 检测失败（非 MIUI 或反射被拦）时乐观返回 true，避免误报。
      */
-    fun backgroundPopupAllowed(ctx: Context): Boolean {
+    /**
+     * MIUI 扩展 op 的统一判定：这类 op（后台弹窗 10011、通知类短信 10018…）都是
+     * 「默认放行，用户显式拒绝才拦截」——无记录时 checkOpNoThrow 返回 MODE_DEFAULT，
+     * 功能实际可用。因此不能只认 MODE_ALLOWED（会把正常状态误报成缺失），
+     * 只有明确拒绝（MODE_IGNORED/MODE_ERRORED）才判为不健康。
+     */
+    private fun miuiOpAllowed(ctx: Context, op: Int): Boolean {
         return try {
             val ops = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-            // 旧版签名：checkOpNoThrow(int op, int uid, String packageName)
             val method = AppOpsManager::class.java.getMethod(
                 "checkOpNoThrow",
                 Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, String::class.java
             )
-            // OP_BACKGROUND_START_ACTIVITY = 10011
-            val result = method.invoke(ops, 10011, android.os.Process.myUid(), ctx.packageName) as Int
-            result == AppOpsManager.MODE_ALLOWED
+            val result = method.invoke(ops, op, android.os.Process.myUid(), ctx.packageName) as Int
+            result != AppOpsManager.MODE_IGNORED && result != AppOpsManager.MODE_ERRORED
         } catch (e: Exception) {
-            Log.d(TAG, "后台弹窗权限检测失败，乐观返回 true: ${e.message}")
+            Log.d(TAG, "MIUI op($op) 检测失败，乐观返回 true: ${e.message}")
             true
         }
     }
 
     /**
+     * MIUI/HyperOS「后台弹窗」权限（允许后台启动 Activity）。
+     *
+     * 对应 Android hide op OP_BACKGROUND_START_ACTIVITY (code=10011)。
+     * 检测失败（非 MIUI 或反射被拦）时乐观返回 true，避免误报。
+     */
+    fun backgroundPopupAllowed(ctx: Context): Boolean = miuiOpAllowed(ctx, 10011)
+
+    /**
      * MIUI/HyperOS「通知类短信」权限。
      *
-     * 这是 MIUI 自定义的 op，标准 API 无法检测；尝试反射 MIUI 的 op name，
-     * 全部失败时乐观返回 true。
+     * 实机（澎湃OS 1, MIX4）逆向确认：该权限对应 MIUI 扩展 AppOp
+     * OP_READ_NOTIFICATION_SMS = 10018（定义在 com.miui.internal.os.MiuiHooks）。
+     * 106/银行/验证码短信全部归为通知类，第三方 app 未授权时 SmsProvider 静默过滤，
+     * READ_SMS 已授予也只能读到个人号短信、且不报错。系统侧判定见
+     * MmsSmsUtils.allowReadNotificationSms（com.android.phone）。
+     *
+     * 三态实测：显式 deny → SmsProvider 过滤；用户手动开启 = 删除 deny 记录回到
+     * MODE_DEFAULT，功能正常。所以判定走 miuiOpAllowed（只在明确拒绝时不健康），
+     * 不能只认 MODE_ALLOWED——那会把正常的 default 态误报成缺失。
+     *
+     * 标准 AppOpsManager 不认这个 op（cmd appops 用名字查报 Unknown operation），
+     * 必须用 int 编号走反射 checkOpNoThrow(int,int,String)。检测失败时乐观返回 true，
+     * 避免在非 MIUI / 反射被拦的 ROM 上误报。
      */
-    fun notificationSmsAllowed(ctx: Context): Boolean {
-        return try {
-            val ops = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-            // 尝试用 String op name 调用（MIUI 扩展签名）
-            val method = AppOpsManager::class.java.getMethod(
-                "checkOpNoThrow",
-                String::class.java, Int::class.javaPrimitiveType, String::class.java
-            )
-            for (opName in listOf("OP_NOTIFICATION_SMS", "NOTIFICATION_SMS", "OP_SMS_NOTIFICATION")) {
-                try {
-                    val result = method.invoke(ops, opName, android.os.Process.myUid(), ctx.packageName) as Int
-                    return result == AppOpsManager.MODE_ALLOWED
-                } catch (_: Exception) { /* 试下一个 */ }
-            }
-            // 全部 op name 都不认，乐观返回 true
-            true
-        } catch (e: Exception) {
-            Log.d(TAG, "通知类短信权限检测失败，乐观返回 true: ${e.message}")
-            true
-        }
-    }
+    fun notificationSmsAllowed(ctx: Context): Boolean = miuiOpAllowed(ctx, 10018)
 
     /**
      * 权限检查列表，顺序即引导顺序。
@@ -203,4 +227,159 @@ object PermissionStatus {
     }
 
     fun pendingCount(ctx: Context): Int = all(ctx).count { !it.granted }
+
+    // MARK: - 短信同步守卫（首页警告条 / 后台看门狗共用）
+
+    /** 一类会导致短信收不到的问题，以及它能否被 App 自动修复 */
+    enum class Fix {
+        /** 运行时权限：可直接弹系统授权框自动修复 */
+        RUNTIME_PERM,
+        /** 通知监听服务掉绑但开关还在：可 requestRebind 自动重绑 */
+        REBIND_LISTENER,
+        /** 必须用户去系统设置手动操作（MIUI 扩展权限、NLS 总开关、电池白名单） */
+        MANUAL
+    }
+
+    data class SmsIssue(
+        val key: String,
+        val label: String,
+        val why: String,
+        val fix: Fix,
+        val granted: Boolean
+    )
+
+    /**
+     * 返回当前所有"会导致短信收不到/发不出"的未决问题，按处理优先级排序。
+     *
+     * 只挑与短信链路强相关的项，不把图片/存储等无关权限混进来；
+     * 非 MIUI 设备天然没有通知类短信/后台弹窗两项。
+     */
+    fun smsIssues(ctx: Context): List<SmsIssue> {
+        val issues = ArrayList<SmsIssue>()
+
+        val missingSms = missingSmsRuntimePermissions(ctx)
+        if (missingSms.isNotEmpty()) {
+            val onlyNotify = missingSms.all { it == Manifest.permission.POST_NOTIFICATIONS }
+            issues += SmsIssue(
+                key = KEY_RUNTIME,
+                label = "短信权限",
+                why = if (onlyNotify) "需要通知权限才能提示同步状态"
+                else "需要读取/接收短信权限才能同步验证码",
+                fix = Fix.RUNTIME_PERM,
+                granted = false
+            )
+        }
+
+        // 通知使用权总开关：没开只能去系统设置
+        if (!notificationListenerEnabled(ctx)) {
+            issues += SmsIssue(
+                key = KEY_NLS_SWITCH,
+                label = "通知使用权",
+                why = "绕开厂商对短信广播的拦截，需要开启通知使用权",
+                fix = Fix.MANUAL,
+                granted = false
+            )
+        } else if (!notificationListenerConnected(ctx)) {
+            // 开关在但服务没绑：可自动重绑
+            issues += SmsIssue(
+                key = KEY_NLS_REBIND,
+                label = "通知监听未连接",
+                why = "监听服务被系统解绑，短信通知无法触发",
+                fix = Fix.REBIND_LISTENER,
+                granted = false
+            )
+        }
+
+        if (!batteryUnrestricted(ctx)) {
+            issues += SmsIssue(
+                key = KEY_BATTERY,
+                label = "电池优化",
+                why = "息屏后可能被系统冻结，导致短信延迟或断同步",
+                fix = Fix.MANUAL,
+                granted = false
+            )
+        }
+
+        if (isMiui()) {
+            if (!notificationSmsAllowed(ctx)) {
+                issues += SmsIssue(
+                    key = KEY_MIUI_NOTIF_SMS,
+                    label = "通知类短信",
+                    why = "验证码、银行等 106 短信属通知类，MIUI 默认禁止第三方读取",
+                    fix = Fix.MANUAL,
+                    granted = false
+                )
+            }
+            if (!backgroundPopupAllowed(ctx)) {
+                issues += SmsIssue(
+                    key = KEY_MIUI_POPUP,
+                    label = "后台弹窗",
+                    why = "允许 App 在后台拉起同步和提醒页面",
+                    fix = Fix.MANUAL,
+                    granted = false
+                )
+            }
+        }
+
+        return issues
+    }
+
+    const val KEY_RUNTIME = "runtime"
+    const val KEY_NLS_SWITCH = "nls_switch"
+    const val KEY_NLS_REBIND = "nls_rebind"
+    const val KEY_BATTERY = "battery"
+    const val KEY_MIUI_NOTIF_SMS = "miui_notif_sms"
+    const val KEY_MIUI_POPUP = "miui_popup"
+
+    /**
+     * 为"必须手动处理"的问题构造跳转 Intent；返回 null 表示找不到可处理的系统页。
+     * MIUI 扩展权限都收敛到应用权限编辑页（通知类短信、后台弹窗在同一页里）。
+     * 调用方若在 Activity 之外使用需自行补 FLAG_ACTIVITY_NEW_TASK。
+     */
+    fun manualFixIntent(ctx: Context, key: String): Intent? {
+        val intent = when (key) {
+            KEY_NLS_SWITCH -> Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+
+            KEY_BATTERY -> Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(Uri.parse("package:${ctx.packageName}"))
+
+            KEY_MIUI_NOTIF_SMS, KEY_MIUI_POPUP -> miuiAppPermEditorIntent(ctx)
+                ?: Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                    .setData(Uri.parse("package:${ctx.packageName}"))
+
+            else -> Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .setData(Uri.parse("package:${ctx.packageName}"))
+        }
+        return intent.takeIf {
+            try {
+                ctx.packageManager.resolveActivity(it, 0) != null
+            } catch (_: Exception) {
+                true // 解析失败也返回，让调用方 try-startActivity 兜底
+            }
+        }
+    }
+
+    /** MIUI/HyperOS 应用权限编辑页，按版本试候选 Activity */
+    private fun miuiAppPermEditorIntent(ctx: Context): Intent? {
+        val candidates = listOf(
+            Intent("miui.intent.action.APP_PERM_EDITOR").putExtra(
+                "miui.intent.extra.package_name", ctx.packageName
+            ),
+            Intent().setClassName(
+                "com.miui.securitycenter",
+                "com.miui.permcenter.permissions.PermissionsEditorActivity"
+            ).putExtra("extra_package_name", ctx.packageName),
+            Intent().setClassName(
+                "com.miui.securitycenter",
+                "com.miui.permcenter.activity.PermissionsEditorActivity"
+            ).putExtra("extra_package_name", ctx.packageName)
+        )
+        return candidates.firstOrNull {
+            try {
+                ctx.packageManager.resolveActivity(it, 0) != null
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
 }
