@@ -170,7 +170,14 @@ object PermissionStatus {
             )
             val result = method.invoke(ops, op, android.os.Process.myUid(), ctx.packageName) as Int
             result != AppOpsManager.MODE_IGNORED && result != AppOpsManager.MODE_ERRORED
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            // 澎湃OS 实测：扩展 op 被显式拒绝时 AppOpsService 不返回错误码，而是直接
+            // 抛 SecurityException（系统侧 MmsSmsUtils 调 checkOp 同样会抛）。
+            // 这是明确的"拒绝"信号，必须判不健康，不能乐观放行。
+            if (e.cause is SecurityException) false
+            else { Log.d(TAG, "MIUI op($op) 检测异常，乐观 true: ${e.cause}"); true }
         } catch (e: Exception) {
+            // 反射入口都找不到（非 MIUI / 被隐藏）：乐观 true 避免误报
             Log.d(TAG, "MIUI op($op) 检测失败，乐观返回 true: ${e.message}")
             true
         }
