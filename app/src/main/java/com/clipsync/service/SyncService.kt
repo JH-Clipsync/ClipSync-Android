@@ -336,6 +336,15 @@ class SyncService : Service() {
     }
 
     /**
+     * 本机接码卡号（设置页手填，存在 clipsync prefs）。
+     * Android 10+ 无法稳定读取本机号码，只能由用户填写；作为短信 payload.receiver
+     * 明文上行，供服务端开放接口按收端号码筛选。
+     */
+    private fun localPhoneNumber(): String =
+        getSharedPreferences("clipsync", MODE_PRIVATE)
+            .getString("local_phone_number", null)?.trim().orEmpty()
+
+    /**
      * 读取本机同步开关，拼成上报字符串：
      *   clip_up  = 本机剪贴板变化会自动上行（upload_enabled）
      *   sms_in   = 短信同步上行（同步总开关开启即视为开启，短信由 SmsReceiver/通知监听触发）
@@ -368,7 +377,9 @@ class SyncService : Service() {
         val syncPassword = com.clipsync.crypto.PayloadCipher.effectivePassword(this)
         // 本机同步开关，上报给服务端用于在线列表展示
         val caps = buildCaps()
-        val wsClient = WsClient(server, token, deviceID, syncPassword, caps, deviceName).also { it.start() }
+        val wsClient = WsClient(
+            server, token, deviceID, syncPassword, caps, deviceName, localPhoneNumber()
+        ).also { it.start() }
         ws = wsClient
         currentWs = wsClient
 
@@ -559,6 +570,8 @@ class SyncService : Service() {
                     mime = "text/plain",
                     preview = item.preview,
                     kind = "sms_code",
+                    smsSender = item.sender,
+                    smsReceiver = localPhoneNumber(),
                     id = item.id
                 )
                 if (sent) {

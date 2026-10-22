@@ -123,14 +123,18 @@ object PayloadCipher {
             Log.w("ClipSync", "⚠ 加密失败，退回明文发送")
             return payload
         }
-        // 只保留信封 + 占位预览；kind 保留以便收端在解密前做分类
+        // 信封外保留 kind 和明文凭据号码：
+        // - kind：收端解密前分类用；
+        // - sender/receiver：服务端开放接口按发送/接收号码筛选，必须在密文外可见；
+        // 短信正文仍只存在 enc 中，服务端无法解密。
         return MessagePayload(
             text = null,
             mime = null,
             data = null,
             preview = PLACEHOLDER,
             kind = payload.kind,
-            sender = null,
+            sender = payload.sender?.takeIf { it.isNotBlank() },
+            receiver = payload.receiver?.takeIf { it.isNotBlank() },
             enc = env
         )
     }

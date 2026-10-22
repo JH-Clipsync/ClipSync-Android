@@ -105,7 +105,7 @@ object SmsDatabasePoller {
             val sender = addr.ifBlank { "未知" }
             val fullText = composeSmsText(sender, body)
             val preview = "来自 $sender 的短信"
-            PendingSmsQueue.enqueue(ctx, fullText, preview)
+            PendingSmsQueue.enqueue(ctx, fullText, preview, sender)
             com.clipsync.history.HistoryStore.addSms(
                 ctx,
                 com.clipsync.history.HistoryStore.HistoryItem(

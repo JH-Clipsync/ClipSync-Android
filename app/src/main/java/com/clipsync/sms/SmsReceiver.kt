@@ -58,8 +58,8 @@ class SmsReceiver : BroadcastReceiver() {
         }
         Log.i("ClipSync", "↑ 收到短信(明文广播): ${fullText.take(40)}")
 
-        // 3) 持久化进队列：进程被杀也丢不了
-        PendingSmsQueue.enqueue(context, fullText, preview)
+        // 3) 持久化进队列：进程被杀也丢不了。sender 单独明文落盘，供服务端按号码筛选。
+        PendingSmsQueue.enqueue(context, fullText, preview, fromNumber)
 
         // 4) 存本地历史（出）
         HistoryStore.addSms(

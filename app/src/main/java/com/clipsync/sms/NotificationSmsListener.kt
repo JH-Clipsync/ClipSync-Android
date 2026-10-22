@@ -366,7 +366,7 @@ class NotificationSmsListener : NotificationListenerService() {
         // 统一走"先落盘、后补发"路径：通知监听里直接 ws.send() 时若连接是半开的
         // （息屏 Doze 下被 NAT 静默掐断），消息写进本地缓冲区返回成功却石沉大海，
         // 这条验证码就丢了。落盘后由 SyncService 补发、确认双向通畅后才删盘。
-        PendingSmsQueue.enqueue(this, fullText, preview)
+        PendingSmsQueue.enqueue(this, fullText, preview, sender)
         com.clipsync.history.HistoryStore.addSms(
             this,
             com.clipsync.history.HistoryStore.HistoryItem(

@@ -21,26 +21,33 @@ object PendingSmsQueue {
     /** 队列上限：超过丢最旧的，避免长期离线无限积压 */
     private const val MAX_ITEMS = 100
 
-    /** 同一正文在此时长内不重复入队（广播和通知监听可能各报一次同一条短信） */
+    /** 同一号码+正文在此时长内不重复入队（广播和通知监听可能各报一次同一条短信） */
     private const val DEDUP_WINDOW_MS = 60_000L
 
     data class Item(
         val id: String,
         val text: String,
         val preview: String,
-        val ts: Long
+        val ts: Long,
+        val sender: String = ""
     )
 
     /**
-     * 入队。自动补 id（旧版无 id 数据在 load 时补齐），并在同正文短时间内去重。
+     * 入队。自动补 id（旧版无 id 数据在 load 时补齐），并在同号码+正文短时间内去重。
      */
-    fun enqueue(context: Context, text: String, preview: String) {
+    fun enqueue(context: Context, text: String, preview: String, sender: String = "") {
         val list = load(context).toMutableList()
         val now = System.currentTimeMillis()
-        if (list.any { it.text == text && now - it.ts < DEDUP_WINDOW_MS }) {
+        val normalizedSender = sender.trim()
+        if (list.any {
+                it.text == text &&
+                    it.sender == normalizedSender &&
+                    now - it.ts < DEDUP_WINDOW_MS
+            }
+        ) {
             return
         }
-        list.add(Item(UUID.randomUUID().toString(), text, preview, now))
+        list.add(Item(UUID.randomUUID().toString(), text, preview, now, normalizedSender))
         while (list.size > MAX_ITEMS) list.removeAt(0)
         save(context, list)
     }
@@ -57,7 +64,8 @@ object PendingSmsQueue {
                     id = obj.optString("id", "").ifEmpty { UUID.randomUUID().toString() },
                     text = obj.optString("text", ""),
                     preview = obj.optString("preview", ""),
-                    ts = obj.optLong("ts", 0L)
+                    ts = obj.optLong("ts", 0L),
+                    sender = obj.optString("sender", "")
                 )
             )
         }
@@ -79,6 +87,7 @@ object PendingSmsQueue {
             obj.put("text", it.text)
             obj.put("preview", it.preview)
             obj.put("ts", it.ts)
+            obj.put("sender", it.sender)
             arr.put(obj)
         }
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE)

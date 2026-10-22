@@ -6,6 +6,7 @@ import com.clipsync.crypto.PayloadCipher
 import com.clipsync.model.ClientRole
 import com.clipsync.model.Message
 import com.clipsync.model.MessagePayload
+import com.clipsync.model.MessageType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -46,7 +47,9 @@ class WsClient(
     /** 本机同步能力/开关，逗号分隔，上报给服务端用于在线列表展示 */
     private val caps: String = "",
     /** 机器级自定义设备名（与登录账号无关），换用户登录时沿用 */
-    private val deviceName: String = ""
+    private val deviceName: String = "",
+    /** 本机接码卡号（设置页手填）；短信 payload.receiver 明文带出，供开放 API 筛选 */
+    private val localPhoneNumber: String = ""
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
@@ -322,15 +325,26 @@ class WsClient(
         mime: String? = null,
         preview: String? = null,
         kind: String? = null,
+        smsSender: String? = null,
+        smsReceiver: String? = null,
         to: String = "*",
         id: String = UUID.randomUUID().toString()
     ): Boolean {
+        // 短信上行：接收方为本机接码卡号。Android 10+ 无法稳定自动读取本机号，
+        // 使用设置中用户填写的号码；sender 来自短信来源（广播/通知/数据库）。
+        val resolvedReceiver = if (type == MessageType.NOTIFY_PC) {
+            smsReceiver ?: localPhoneNumber
+        } else {
+            smsReceiver
+        }
         val plainPayload = MessagePayload(
             text = payloadText,
             data = payloadData,
             mime = mime,
             preview = preview,
-            kind = kind
+            kind = kind,
+            sender = smsSender?.takeIf { it.isNotBlank() },
+            receiver = resolvedReceiver?.takeIf { it.isNotBlank() }
         )
         // 加密开启时，服务端只会看到信封；关闭时保持原有明文行为
         val outgoingPayload = if (syncPassword.isNotEmpty()) {

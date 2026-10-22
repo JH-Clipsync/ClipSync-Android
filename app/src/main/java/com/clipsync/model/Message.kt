@@ -72,7 +72,12 @@ data class MessagePayload(
     val data: String? = null,      // base64（图片等二进制）
     val preview: String? = null,   // 短预览
     val kind: String? = null,      // 业务子类型：sms_code / text / image / share ...
-    val sender: String? = null,    // 短信发件人（服务端清洗后填入）
+    // 短信发送方号码（1069 通道号 / 银行短号 / 个人手机号）。有意留在加密信封外、
+    // 以明文随 payload 上行：端到端加密只保护正文，号码是供服务端开放接口筛选的元数据。
+    val sender: String? = null,
+    // 短信接收方号码（本机接码卡手机号），同样明文留在信封外，供按收端卡号筛选。
+    // Android 10+ 读不到本机号，由用户在设置里填写后随短信带出。
+    val receiver: String? = null,
     /** 加密信封；非空时 text/data 为空，真实内容在 enc.ct 里 */
     val enc: com.clipsync.crypto.EncEnvelope? = null,
     /** server_kick 消息的原因：password_reset / user_disabled / device_banned ... */

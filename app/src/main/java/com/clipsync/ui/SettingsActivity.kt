@@ -43,6 +43,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var accountValue: android.widget.TextView
     private lateinit var syncPwdValue: android.widget.TextView
     private var permBadge: android.widget.TextView? = null
+    private var localPhoneValue: android.widget.TextView? = null
 
     /** 指纹说明文案，加密开关和密码变更后都要刷新它 */
     private var fingerprintView: android.widget.TextView? = null
@@ -65,6 +66,7 @@ class SettingsActivity : AppCompatActivity() {
 
         buildConnectionGroup(container)
         buildCryptoGroup(container)
+        buildSmsGroup(container)
         buildClipboardGroup(container)
         buildOtherGroup(container)
 
@@ -315,6 +317,46 @@ class SettingsActivity : AppCompatActivity() {
                 fp == null -> "$prefix\n无法派生密钥，请换一个密码"
                 else -> "$prefix\n密钥指纹 $fp"
             }
+        }
+    }
+
+    // MARK: - 分组：短信同步
+
+    private fun buildSmsGroup(parent: LinearLayout) {
+        val card = SettingsRows.group(this, parent, "短信同步")
+
+        localPhoneValue = SettingsRows.valueRow(
+            this, card, "本机接码卡号", localPhoneSummary()
+        ) { editLocalPhone() }
+        SettingsRows.note(
+            this, card,
+            "作为接收号码随短信明文上报（验证码正文仍端到端加密），供开放接口按收端号码筛选。"
+        )
+    }
+
+    private fun localPhoneSummary(): String =
+        getSharedPreferences("clipsync", MODE_PRIVATE)
+            .getString("local_phone_number", "")?.takeIf { it.isNotBlank() } ?: "未填写"
+
+    private fun editLocalPhone() {
+        val current = getSharedPreferences("clipsync", MODE_PRIVATE)
+            .getString("local_phone_number", "") ?: ""
+        val input = DesignDialog.input(
+            this, "本机接收短信的手机号",
+            current,
+            InputType.TYPE_CLASS_PHONE
+        )
+        DesignDialog.show(
+            this, "本机接码卡号",
+            "Android 10+ 无法自动读取本机号码，需手动填写一次。填错会导致按收端号码查不到。",
+            body = { it.addView(input, matchWrap()) }
+        ) {
+            val typed = input.text.toString().trim()
+            getSharedPreferences("clipsync", MODE_PRIVATE)
+                .edit().putString("local_phone_number", typed).apply()
+            localPhoneValue?.text = if (typed.isEmpty()) "未填写" else typed
+            // 发短信时实时读取该值，无需重连即生效
+            toast(if (typed.isEmpty()) "已清空本机号码" else "本机号码已保存", Design.Color.SUCCESS)
         }
     }
 
