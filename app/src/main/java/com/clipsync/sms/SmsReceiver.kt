@@ -48,18 +48,30 @@ class SmsReceiver : BroadcastReceiver() {
         }
         if (body.isBlank()) { pr.finish(); return }
 
+        // 稳定 id 时间戳优先取 provider DATE（系统先写库后广播，反查成功即与通知/轮询同源）；
+        // 查不到才退回短信服务中心时间戳。
+        val scDate = messages.firstOrNull()?.timestampMillis ?: System.currentTimeMillis()
+        val smsDate = SmsDatabasePoller.findInboxDate(context, fromNumber, body) ?: scDate
+        val smsId = SmsFingerprint.derive(context, fromNumber, smsDate, body)
+
         val fullText = SmsDatabasePoller.composeSmsText(fromNumber, body)
         val preview = "来自 $fromNumber 的短信"
 
-        if (!SmsDeduplicator.shouldUpload(fromNumber, isPlaintext = true)) {
-            Log.i("ClipSync", "⏸ 短信去重（广播）: $fromNumber")
+        if (!SmsDeduplicator.shouldUpload(smsId, isPlaintext = true)) {
+            Log.i("ClipSync", "⏸ 短信去重（广播）: $fromNumber id=$smsId")
             pr.finish()
             return
         }
-        Log.i("ClipSync", "↑ 收到短信(明文广播): ${fullText.take(40)}")
+        Log.i("ClipSync", "↑ 收到短信(明文广播): ${fullText.take(40)} id=$smsId")
 
         // 3) 持久化进队列：进程被杀也丢不了。sender 单独明文落盘，供服务端按号码筛选。
-        PendingSmsQueue.enqueue(context, fullText, preview, fromNumber)
+        //    三源同一物理短信使用同一稳定 id，队列层自动完成去重/补明文更新。
+        val enqueueResult = PendingSmsQueue.enqueue(context, smsId, fullText, preview, fromNumber)
+        // 把同一指纹登记进轮询 seen 并推进水位，杜绝 20s 后的二次打捞
+        SmsDatabasePoller.markSeen(context, smsId, smsDate)
+        if (enqueueResult == PendingSmsQueue.EnqueueResult.UPDATED) {
+            Log.i("ClipSync", "🔓 同 id 正文已更新为广播明文（补明文）: $smsId")
+        }
 
         // 4) 存本地历史（出）
         HistoryStore.addSms(

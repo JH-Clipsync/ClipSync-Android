@@ -60,6 +60,17 @@ class SyncService : Service() {
         /** 权限提醒最小间隔，避免看门狗每 20s 骚扰一次 */
         private const val PERM_ALERT_INTERVAL_MS = 6 * 60 * 60 * 1000L // 6 小时
 
+        /** 看门狗循环细粒度 tick：权限守卫/ping 仍按 20s 节奏，短信查库可在 tick 间自适应 */
+        private const val WATCHDOG_TICK_MS = 2_000L
+        /** 权限守卫 / 应用层 ping / 半开判定 / 75s 确认删盘的节奏（与旧版固定轮询一致） */
+        private const val WATCHDOG_DUTY_INTERVAL_MS = 20_000L
+        /** 空闲时短信数据库轮询间隔 */
+        private const val SMS_POLL_IDLE_INTERVAL_MS = 20_000L
+        /** 通知监听近期有活动时的短轮询间隔（3~5s 区间取 4s） */
+        private const val SMS_POLL_ACTIVE_INTERVAL_MS = 4_000L
+        /** 通知监听"近期活动"判定窗口：最后一条通知落在此时长内即视为活跃 */
+        private const val NOTIF_ACTIVITY_WINDOW_MS = 30_000L
+
         @Volatile
         private var currentWs: WsClient? = null
 
@@ -119,6 +130,22 @@ class SyncService : Service() {
          * 期间若检测到半开/断线，条目还在磁盘上，重连后用同一 id 补发。
          */
         private val inflightSms = LinkedHashMap<String, Long>()
+
+        /** 重连补发治理的抑制窗口：覆盖 75s 磁盘确认期并留余量 */
+        private const val RESEND_SUPPRESS_WINDOW_MS = 120_000L
+        /** 近期已发记忆上限，防止极端积压下内存无限增长 */
+        private const val RECENT_SENT_MAX = 200
+
+        /**
+         * 近期已成功写入 ws 的短信帧（纯内存，进程重启可丢）。
+         *
+         * 看门狗判半开 forceReconnect 后，新连接 OPEN 会重发整个磁盘队列；
+         * 但其中很多帧在上一条连接上其实已经送达。重发时若同 id 且正文 hash 相同、
+         * 且距上次成功写入不足 [RESEND_SUPPRESS_WINDOW_MS]，直接跳过，桌面端不再
+         * 收到重复弹窗。正文 hash 不同（同 id 补明文）时不跳过，保证内容更新能送达。
+         */
+        private class SentRecord(val at: Long, val bodyHash: Int)
+        private val recentlySentSms = LinkedHashMap<String, SentRecord>()
 
         /**
          * 重启同步服务：登录 / 退出登录 / 改同步密码后调用，
@@ -559,12 +586,17 @@ class SyncService : Service() {
     }
 
     /**
-     * 连接就绪后补发磁盘上的待发短信（冷启动 / 半开重连后都会调）。
+     * 连接就绪后补发磁盘上的待发短信（冷启动 / 半开重连后都会调）。磁盘条目用稳定 id
+     * 发出并记入 inflight，不立即删盘；75s 后链路仍双向通畅才确认删除，半开下"发出即丢"
+     * 的短信重连后自动补发且 id 不变，PC 端按 id 去重不会重复弹窗。
      *
-     * 短信在发送前已落盘（PendingSmsQueue），这里只负责把磁盘条目用**稳定 id**
-     * 发出去并记入 inflight；不立即删盘。75s 后链路仍双向通畅才确认删除，
-     * 这样半开连接下"发出去其实丢了"的短信重连后会自动补发，且 id 不变，
-     * PC 端按消息 id 去重，不会重复弹窗。
+     * 重连补发治理：同 id + 同正文 hash 在 120s 内已成功写入 ws 的条目跳过
+     * （[recentlySentSms]，纯内存），治"半开重连后整盘重发"的重复帧；75s 删盘机制不动。
+     *
+     * 补明文（同 id 内容更新）：通知帧文本可能残缺，广播/查库拿到明文后以同一 id 重新
+     * 落盘（EnqueueResult.UPDATED）。id+正文 hash 双键记忆使正文变化不被抑制，两帧同 id。
+     * 现有信封无"内容更新"标记字段（model/ 协议不改、Server 原样透传 JSON），桌面端按
+     * id 去重并保留正文更完整的一帧（无 ****** 打码、正文更长）。
      */
     private fun flushPendingSms() {
         val wsClient = ws ?: return
@@ -572,9 +604,21 @@ class SyncService : Service() {
         val items = com.clipsync.sms.PendingSmsQueue.load(this)
         if (items.isEmpty()) return
         var ok = 0
+        var suppressed = 0
         val now = System.currentTimeMillis()
         synchronized(inflightSms) {
             items.forEach { item ->
+                val bodyHash = item.text.hashCode()
+                synchronized(recentlySentSms) {
+                    val record = recentlySentSms[item.id]
+                    if (record != null &&
+                        record.bodyHash == bodyHash &&
+                        now - record.at < RESEND_SUPPRESS_WINDOW_MS
+                    ) {
+                        suppressed++
+                        return@forEach
+                    }
+                }
                 val sent = wsClient.send(
                     type = MessageType.NOTIFY_PC,
                     payloadText = item.text,
@@ -588,10 +632,24 @@ class SyncService : Service() {
                 if (sent) {
                     ok++
                     inflightSms[item.id] = now
+                    synchronized(recentlySentSms) {
+                        recentlySentSms[item.id] = SentRecord(now, bodyHash)
+                        while (recentlySentSms.size > RECENT_SENT_MAX) {
+                            val it = recentlySentSms.entries.iterator()
+                            if (!it.hasNext()) break
+                            it.next()
+                            it.remove()
+                        }
+                    }
                 }
             }
         }
-        Log.i("ClipSync", "↑ 待发短信已发出 $ok/${items.size} 条（等待 75s 通畅确认后清盘）")
+        Log.i(
+            "ClipSync",
+            "↑ 待发短信已发出 $ok/${items.size} 条" +
+                (if (suppressed > 0) "，跳过 120s 内已送达同帧 $suppressed 条" else "") +
+                "（等待 75s 通畅确认后清盘）"
+        )
     }
 
     /**
@@ -705,38 +763,60 @@ class SyncService : Service() {
     }
 
     /**
-     * 短信投递确认 + 半开连接看门狗。
+     * 短信投递确认 + 半开连接看门狗。循环以 [WATCHDOG_TICK_MS] 细粒度 tick 运行，两套节奏：
      *
-     * 每 20s 跑一次：
-     * 1. OPEN 时发一帧应用层 ping；收到服务端 pong 或任何数据帧即把未应答计数清零。
-     * 2. 连续 3 个 ping（≈60s）都收不到任何回应 → 判定为半开连接，主动断掉重建。
-     *    不用"墙钟 idle 时长"判定：息屏 Doze 时 CPU 被冻结，墙钟会把整个休眠
-     *    时长算进去造成误重连（表现为 Mac 反复弹"设备上线"）；而真实半开连接
-     *    在唤醒后发 ping 照样收不到 pong，计数判据能正确抓到、又不会误伤休眠。
-     * 3. 重连带 90s 最小间隔退避，避免抖动期反复触发服务端上下线广播。
-     * 4. 发出满 75s、且当前链路仍双向通畅的短信，从磁盘待发队列确认删除。
+     * 短信查库（自适应）：通知监听 30s 内有活动（短信正在到达）→ 每 4s 查一次，配合
+     * NotificationSmsListener 的 2.5s 事件驱动一次性查库，把兜底延迟从 0~20s 压到秒级；
+     * 空闲恢复 20s。
+     *
+     * 看门狗职责（固定 20s，节奏与旧版一致）：
+     * 1. OPEN 时发应用层 ping，收到 pong 或任何数据帧即清零未应答计数；
+     * 2. 连续 3 个 ping（≈60s）无回应 → 判半开主动重建。不用墙钟 idle 判据：息屏 Doze
+     *    CPU 冻结会把休眠时长算进去造成误重连（Mac 反复弹"设备上线"），计数判据能抓
+     *    真实半开又不误伤休眠；
+     * 3. 重连带 90s 最小间隔退避，避免抖动期反复触发上下线广播；
+     * 4. 发出满 75s 且链路仍双向通畅的短信，从磁盘待发队列确认删除。
      */
     private fun startSmsWatchdog() {
         serviceScope.launch {
+            var lastWatchdogDutyAt = 0L
+            var lastSmsPollAt = 0L
             while (true) {
-                kotlinx.coroutines.delay(20_000L)
+                kotlinx.coroutines.delay(WATCHDOG_TICK_MS)
                 if (destroyed) break
+                val now = System.currentTimeMillis()
+
+                // —— 自适应短信数据库轮询（与 20s 看门狗职责解耦）——
+                // MIUI 上 SMS 广播可能被拦、短信通知可能不投递，但 READ_SMS 总能读到库。
+                // 断连期间也照常落盘，重连后 flush 会一起发。
+                val pollInterval =
+                    if (now - com.clipsync.sms.NotificationSmsListener.lastNotifyAt < NOTIF_ACTIVITY_WINDOW_MS) {
+                        SMS_POLL_ACTIVE_INTERVAL_MS
+                    } else {
+                        SMS_POLL_IDLE_INTERVAL_MS
+                    }
+                if (now - lastSmsPollAt >= pollInterval) {
+                    lastSmsPollAt = now
+                    var newCount = 0
+                    try {
+                        newCount = com.clipsync.sms.SmsDatabasePoller.pollNewSms(this@SyncService)
+                    } catch (e: Exception) {
+                        Log.w("ClipSync", "短信轮询异常: ${e.message}")
+                    }
+                    if (newCount > 0) {
+                        Log.i("ClipSync", "🔁 轮询发现 $newCount 条新短信已落盘")
+                        val w = ws
+                        if (w != null && w.state.value == WsClient.State.OPEN) flushPendingSms()
+                    }
+                }
+
+                // —— 固定 20s 的看门狗职责 ——
+                if (now - lastWatchdogDutyAt < WATCHDOG_DUTY_INTERVAL_MS) continue
+                lastWatchdogDutyAt = now
+
                 // 短信链路权限/组件守卫：与连接状态无关，连接中也要监测
                 runPermissionGuard()
                 val wsClient = ws ?: continue
-                // 短信数据库轮询兜底：MIUI 上 SMS 广播被拦、短信通知不投递给第三方监听，
-                // 但 READ_SMS 能读到数据库。发现新短信先落盘，OPEN 时立即补发。
-                // 放在连接状态判断之前：断连期间也要落盘，重连后 flush 会一起发。
-                var newCount = 0
-                try {
-                    newCount = com.clipsync.sms.SmsDatabasePoller.pollNewSms(this@SyncService)
-                } catch (e: Exception) {
-                    Log.w("ClipSync", "短信轮询异常: ${e.message}")
-                }
-                if (newCount > 0) {
-                    Log.i("ClipSync", "🔁 轮询发现 $newCount 条新短信已落盘")
-                    if (wsClient.state.value == WsClient.State.OPEN) flushPendingSms()
-                }
                 if (wsClient.state.value != WsClient.State.OPEN) {
                     synchronized(inflightSms) { inflightSms.clear() }
                     continue
@@ -750,6 +830,7 @@ class SyncService : Service() {
                         synchronized(inflightSms) { inflightSms.clear() }
                         // 关掉这条半死不活的连接，WsClient 的重连循环立刻建新连；
                         // 新连接 OPEN 后 flushPendingSms 会用同一 id 补发磁盘上的短信
+                        // （120s 内已送达的同 id 同正文帧会被 recentlySentSms 抑制）
                         wsClient.forceReconnect()
                     } else {
                         Log.i("ClipSync", "🔍 看门狗：疑似半开但距上次重连仅 ${sinceLast / 1000}s，跳过（退避中）")

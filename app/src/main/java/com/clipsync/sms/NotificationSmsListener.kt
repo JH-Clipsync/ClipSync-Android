@@ -251,6 +251,10 @@ class NotificationSmsListener : NotificationListenerService() {
             pkg.contains("message", ignoreCase = true)
         if (!isSmsApp) return
 
+        // 事件驱动查库：2.5s 后一次性查短信库。放在所有早退分支之前，打码/摘要/系统提示
+        // return 后也有短延迟兜底，不必干等下一轮 20s 轮询；多次通知合并为一次查库。
+        SmsDatabasePoller.scheduleEventDrivenPoll(this)
+
         val extras = sbn.notification.extras ?: return
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
@@ -294,7 +298,7 @@ class NotificationSmsListener : NotificationListenerService() {
             bigText.isNotBlank() -> bigText
             else -> text
         }
-        val (dbBody, dbFrom) = queryLatestSms()
+        val (dbBody, dbFrom, dbDate) = queryLatestSms()
 
         // 采信优先级：数据库原文 > 通知各字段
         var body: String = when {
@@ -310,23 +314,34 @@ class NotificationSmsListener : NotificationListenerService() {
             else -> "未知"
         }
 
+        // 稳定 id 时间戳：采信数据库行时与轮询同源（同一行 DATE）；只能退回通知字段时
+        // （库里暂查不到）用当前时间，退化帧 id 无法收敛，但 2.5s 事件查库会补规范明文。
+        var smsDate: Long = dbDate ?: System.currentTimeMillis()
+        // 仅 provider DATE 才允许推进轮询水位：退化路径的墙钟 now 会越过尚未入库行的
+        // DATE 顶高水位，导致事件驱动查库漏掉那行的规范明文。
+        var dateFromProvider = dbDate != null
+
         // 检测正文是否被系统"锁屏防偷窥"打码：内容里连续 5 个及以上 * 视为打码。
         // 这种情况说明拿到的 body 是锁屏隐藏版，绝不能把 ****** 上行。
-        // 但注意：MIUI 上 SMS_RECEIVED 广播是被拦的（旧代码指望"等广播明文"永远等不到），
-        // 所以这里分两步：
+        // MIUI 上 SMS_RECEIVED 广播可能被拦，不能指望"等广播明文"，分两步：
         //   1. 立刻再查一次数据库（短信此刻通常已写入 provider，之前查不到只是回调早于写入）；
         //   2. 若数据库已有明文，用明文继续走落盘；若还没入库，直接 return——
-        //      数据库轮询（SmsDatabasePoller 每 20s）稍后入库时会读到完整原文兜底补发。
+        //      入口处已调度 2.5s 事件驱动查库（SmsDatabasePoller），入库即读到完整原文补发，
+        //      不再干等看门狗最长 20s 的固定轮询。
         val looksMasked = Regex("\\*{5,}").containsMatchIn(body)
         if (looksMasked) {
-            val (retryBody, retryFrom) = queryLatestSms()
+            val (retryBody, retryFrom, retryDate) = queryLatestSms()
             if (!retryBody.isNullOrBlank() && !Regex("\\*{5,}").containsMatchIn(retryBody)) {
                 // 数据库里已有明文：直接用它，继续往下走落盘流程
                 Log.i(TAG, "🔓 通知正文打码，但数据库已查到明文，改用数据库原文")
                 body = retryBody
                 if (!retryFrom.isNullOrBlank()) sender = retryFrom
+                if (retryDate != null) {
+                    smsDate = retryDate
+                    dateFromProvider = true
+                }
             } else {
-                Log.i(TAG, "⏸ 通知正文打码且数据库暂未入库，等待数据库轮询兜底（20s 内）")
+                Log.i(TAG, "⏸ 通知正文打码且数据库暂未入库，等待 2.5s 事件驱动查库兜底")
                 return
             }
         }
@@ -357,16 +372,28 @@ class NotificationSmsListener : NotificationListenerService() {
         // 完整文本：企业短信正文已带【签名】则直接用原文；个人短信才补【发件人】
         val fullText = com.clipsync.sms.SmsDatabasePoller.composeSmsText(sender, body)
         val preview = "来自 $sender 的短信"
-        if (!SmsDeduplicator.shouldUpload(sender, isPlaintext = false)) {
-            Log.i(TAG, "⏸ 短信去重（通知）: $sender")
+        // 三源统一稳定 id：采信数据库行时与轮询/广播路径严格同 id；
+        // 通知字段退化路径见 smsDate 处的注释说明。
+        val smsId = SmsFingerprint.derive(this, sender, smsDate, body)
+        if (!SmsDeduplicator.shouldUpload(smsId, isPlaintext = false)) {
+            Log.i(TAG, "⏸ 短信去重（通知）: $sender id=$smsId")
             return
         }
-        Log.i(TAG, "↑ 收到短信(通知): ${fullText.take(40)}")
+        Log.i(TAG, "↑ 收到短信(通知): ${fullText.take(40)} id=$smsId")
 
         // 统一走"先落盘、后补发"路径：通知监听里直接 ws.send() 时若连接是半开的
         // （息屏 Doze 下被 NAT 静默掐断），消息写进本地缓冲区返回成功却石沉大海，
         // 这条验证码就丢了。落盘后由 SyncService 补发、确认双向通畅后才删盘。
-        PendingSmsQueue.enqueue(this, fullText, preview, sender)
+        val enqueueResult = PendingSmsQueue.enqueue(this, smsId, fullText, preview, sender)
+        // 与轮询共享 seen + 水位：下一轮查库扫到同一行直接跳过，不再二次打捞。
+        // 退化路径（无 provider 行、时间戳是墙钟）不推进水位，留给 2.5s 事件查库
+        // 用规范 id 把完整原文补进来。
+        if (dateFromProvider) {
+            SmsDatabasePoller.markSeen(this, smsId, smsDate)
+        }
+        if (enqueueResult == PendingSmsQueue.EnqueueResult.UPDATED) {
+            Log.i(TAG, "🔓 同 id 正文已被通知帧更新: $smsId")
+        }
         com.clipsync.history.HistoryStore.addSms(
             this,
             com.clipsync.history.HistoryStore.HistoryItem(
@@ -441,11 +468,12 @@ class NotificationSmsListener : NotificationListenerService() {
     }
 
     /**
-     * 从系统短信数据库查最近 60 秒内的一条收信，返回 (body, address)。
-     * 这是绕过 MIUI 通知栏折叠 body 的关键：数据库里存的一定是完整原文。
-     * 若未授予 READ_SMS 权限或查询失败，返回 (null, null)，调用方自行退回通知里的内容。
+     * 从系统短信数据库查最近 60 秒内的一条收信，返回 (body, address, date)。
+     * 这是绕过 MIUI 通知栏折叠 body 的关键：数据库里存的一定是完整原文；
+     * date 即 Telephony.Sms.DATE，用于派生三源统一稳定 id。
+     * 若未授予 READ_SMS 权限或查询失败，返回 (null, null, null)，调用方自行退回通知里的内容。
      */
-    private fun queryLatestSms(): Pair<String?, String?> {
+    private fun queryLatestSms(): Triple<String?, String?, Long?> {
         return try {
             val uri = Telephony.Sms.CONTENT_URI
             val projection = arrayOf(
@@ -464,15 +492,17 @@ class NotificationSmsListener : NotificationListenerService() {
                 if (c.moveToFirst()) {
                     val bodyIdx = c.getColumnIndex(Telephony.Sms.BODY)
                     val addrIdx = c.getColumnIndex(Telephony.Sms.ADDRESS)
+                    val dateIdx = c.getColumnIndex(Telephony.Sms.DATE)
                     val b = if (bodyIdx >= 0) c.getString(bodyIdx) else null
                     val a = if (addrIdx >= 0) c.getString(addrIdx) else null
-                    return b to a
+                    val d = if (dateIdx >= 0) c.getLong(dateIdx) else null
+                    return Triple(b, a, d)
                 }
             }
-            null to null
+            Triple(null, null, null)
         } catch (e: Exception) {
             Log.w(TAG, "查询 SMS 数据库失败: ${e.message}")
-            null to null
+            Triple(null, null, null)
         }
     }
 }
